@@ -128,6 +128,28 @@ enum Commands {
         #[arg(long)]
         account_id: i64,
     },
+
+    /// Register an account from an existing token cache file
+    RegisterToken {
+        /// Path to the existing token cache file
+        #[arg(long, default_value = "token_cache.json")]
+        token_cache: PathBuf,
+
+        /// Path to Google OAuth client_secret.json
+        #[arg(long, default_value = "client_secret.json")]
+        client_secret: PathBuf,
+    },
+
+    /// Reassign emails and orders from one account to another
+    ReassignAccount {
+        /// Source account ID to move data from
+        #[arg(long)]
+        from_id: i64,
+
+        /// Target account ID to move data to
+        #[arg(long)]
+        to_id: i64,
+    },
 }
 
 #[tokio::main]
@@ -678,6 +700,105 @@ async fn main() -> Result<()> {
             }
 
             println!("\nDone! Run 'debug-accounts' to verify the changes.");
+        }
+
+        Commands::ReassignAccount { from_id, to_id } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Verify both accounts exist
+            let from_email: Option<(String,)> = sqlx::query_as(
+                "SELECT email FROM accounts WHERE id = ?"
+            )
+            .bind(from_id)
+            .fetch_optional(db.pool())
+            .await?;
+
+            let to_email: Option<(String,)> = sqlx::query_as(
+                "SELECT email FROM accounts WHERE id = ?"
+            )
+            .bind(to_id)
+            .fetch_optional(db.pool())
+            .await?;
+
+            let from = match from_email {
+                Some((e,)) => e,
+                None => {
+                    println!("Error: Source account ID {} not found", from_id);
+                    return Ok(());
+                }
+            };
+
+            let to = match to_email {
+                Some((e,)) => e,
+                None => {
+                    println!("Error: Target account ID {} not found", to_id);
+                    return Ok(());
+                }
+            };
+
+            println!("Reassigning data from {} (id={}) to {} (id={})", from, from_id, to, to_id);
+
+            // Update emails
+            let emails_result = sqlx::query(
+                "UPDATE raw_emails SET account_id = ? WHERE account_id = ?"
+            )
+            .bind(to_id)
+            .bind(from_id)
+            .execute(db.pool())
+            .await?;
+
+            println!("Updated {} emails", emails_result.rows_affected());
+
+            // Update orders
+            let orders_result = sqlx::query(
+                "UPDATE orders SET account_id = ? WHERE account_id = ?"
+            )
+            .bind(to_id)
+            .bind(from_id)
+            .execute(db.pool())
+            .await?;
+
+            println!("Updated {} orders", orders_result.rows_affected());
+
+            println!("\nDone! Run 'debug-accounts' to verify.");
+        }
+
+        Commands::RegisterToken { token_cache, client_secret } => {
+            // Initialize database
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Check if token cache file exists
+            if !token_cache.exists() {
+                println!("Error: Token cache file not found: {}", token_cache.display());
+                return Ok(());
+            }
+
+            println!("Discovering email from token cache: {}", token_cache.display());
+
+            // Authenticate using the existing token cache
+            let gmail_client = auth::get_gmail_client(&client_secret, &token_cache).await?;
+
+            // Get the email address
+            let email = auth::get_authenticated_email(&gmail_client).await?;
+            println!("Discovered email: {}", email);
+
+            // Check if account already exists
+            if let Some(existing) = db.get_account_by_email(&email).await? {
+                println!("\nAccount {} is already registered (id: {})", email, existing.id);
+                return Ok(());
+            }
+
+            // Store in database with the existing token cache path
+            let account_id = db.add_account(&email, &token_cache.display().to_string()).await?;
+
+            println!("\nAccount registered successfully!");
+            println!("  Email: {}", email);
+            println!("  Token cache: {}", token_cache.display());
+            println!("  Account ID: {}", account_id);
+            println!("\nYou can now sync emails for this account with:");
+            println!("  cargo run -- sync --account {}", email);
         }
     }
 
