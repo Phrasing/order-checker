@@ -1,0 +1,44 @@
+# Build artifacts
+/target/
+/src-tauri/target/
+Cargo.lock
+
+# Tauri
+/dist/
+/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OAuth credentials (NEVER commit these!)
+client_secret.json
+token_cache.json
+token_cache_*.json
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+NUL
+
+# Debug output
+debug_output.txt
+price_debug*.txt
+
+# Claude Code
+.cdp-tools/
+.claude/
+
+# Emails (sensitive data)
+emails/

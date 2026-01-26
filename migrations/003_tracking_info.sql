@@ -1,0 +1,5 @@
+-- Migration 003: Add tracking information columns to orders table
+-- Supports FedEx, UPS, USPS, and other carriers
+--
+-- This migration adds columns that may already exist.
+-- The application handles "duplicate column" errors gracefully.

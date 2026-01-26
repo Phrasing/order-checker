@@ -1,0 +1,32 @@
+[package]
+name = "walmart-dashboard-tauri"
+version = "0.1.0"
+edition = "2021"
+description = "Walmart Order Dashboard - Native Desktop Application"
+authors = ["Order Reconciler Team"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5"
+
+# Reference the core library
+walmart-dashboard = { path = ".." }
+
+# Database access for tracking commands
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

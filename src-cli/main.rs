@@ -1,0 +1,926 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_appender::rolling;
+
+use walmart_dashboard::{
+    auth::{self, AccountAuth},
+    db::Database,
+    ingestion, process, tracking, web,
+};
+
+/// Walmart Order Dashboard - Track and reconcile orders from email
+#[derive(Parser)]
+#[command(name = "walmart-dashboard")]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to the SQLite database file
+    #[arg(short, long, default_value = "orders.db")]
+    database: PathBuf,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Sync emails from Gmail to the local database
+    Sync {
+        /// Path to Google OAuth client_secret.json
+        #[arg(long, default_value = "client_secret.json")]
+        client_secret: PathBuf,
+
+        /// Path to cache OAuth tokens (legacy, ignored if accounts are configured)
+        #[arg(long, default_value = "token_cache.json")]
+        token_cache: PathBuf,
+
+        /// Custom search query (optional, defaults to Walmart emails)
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Only fetch emails from the last N days (default: 5)
+        #[arg(long, short = 'n', default_value = "5")]
+        days: u32,
+
+        /// Sync only this specific account (email address)
+        #[arg(long)]
+        account: Option<String>,
+    },
+
+    /// Process pending emails and reconcile into orders
+    Process {
+        /// Reset skipped/failed emails to pending before processing
+        #[arg(long)]
+        reset: bool,
+    },
+
+    /// Start the web dashboard server
+    Serve {
+        /// Port to run the web server on
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+    },
+
+    /// Show sync status and database statistics
+    Status,
+
+    /// Clear cached OAuth token (for re-authentication)
+    ClearAuth,
+
+    /// Initialize the database (run migrations)
+    Init,
+
+    /// Debug: dump a sample email from the database
+    DebugEmail {
+        /// Email ID to dump (default: first pending)
+        #[arg(short, long)]
+        id: Option<i64>,
+    },
+
+    /// Clear all raw emails from the database (for resync)
+    ClearEmails,
+
+    /// Clear all orders and line items from the database (for reprocessing)
+    ClearOrders,
+
+    /// Search emails by subject pattern
+    SearchEmails {
+        /// Pattern to search for in subject (case-insensitive)
+        #[arg(short, long)]
+        pattern: String,
+    },
+
+    /// Debug: show events for a specific order
+    DebugOrder {
+        /// Order ID to query
+        #[arg(short, long)]
+        id: String,
+    },
+
+    /// Check delivery status for shipped FedEx orders via carrier API
+    CheckDelivery {
+        /// Dry run - don't update database, just show what would be updated
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Fetch tracking status from 17track.net for shipped orders
+    FetchTracking {
+        /// Specific order ID to fetch tracking for
+        #[arg(long)]
+        order_id: Option<String>,
+
+        /// Force refresh even if cache is fresh
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Refresh stale tracking entries in the cache
+    RefreshTracking {
+        /// Dry run - don't update database, just show what would be refreshed
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show tracking status for a specific order
+    TrackingStatus {
+        /// Order ID to show tracking for
+        order_id: String,
+    },
+
+    // ==================== Account Management ====================
+
+    /// Add a new Gmail account (triggers OAuth flow)
+    AddAccount {
+        /// Path to Google OAuth client_secret.json
+        #[arg(long, default_value = "client_secret.json")]
+        client_secret: PathBuf,
+    },
+
+    /// List all configured Gmail accounts
+    ListAccounts,
+
+    /// Remove a Gmail account
+    RemoveAccount {
+        /// Email address of the account to remove
+        email: String,
+
+        /// Also delete all synced emails and orders for this account
+        #[arg(long)]
+        delete_data: bool,
+    },
+
+    /// Clear OAuth token for a specific account (for re-authentication)
+    ClearAccountAuth {
+        /// Email address of the account
+        email: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Load .env file if present
+    let _ = dotenvy::dotenv();
+
+    // Initialize logging with file output
+    let log_dir = PathBuf::from("logs");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = rolling::daily(&log_dir, "walmart-cli.log");
+    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Console layer: INFO level by default, compact format
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .compact()
+        .with_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        );
+
+    // File layer: DEBUG level, full format with timestamps
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_writer(file_writer)
+        .with_ansi(false)
+        .with_filter(tracing_subscriber::EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
+        .init();
+
+    let cli = Cli::parse();
+
+    // Create database connection
+    let db_path = cli.database;
+    tracing::info!("Using database: {}", db_path.display());
+
+    match cli.command {
+        Commands::Init => {
+            tracing::info!("Initializing database...");
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+            println!("Database initialized successfully at: {}", db_path.display());
+        }
+
+        Commands::Status => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+            let status = ingestion::get_sync_status(&db).await?;
+            println!("{}", status);
+
+            // Also show order counts
+            let order_status = get_order_status(&db).await?;
+            println!("\n{}", order_status);
+        }
+
+        Commands::ClearAuth => {
+            auth::clear_cached_token()?;
+            println!("OAuth token cache cleared. You will need to re-authenticate on next sync.");
+        }
+
+        Commands::Sync {
+            client_secret,
+            token_cache,
+            query,
+            days,
+            account,
+        } => {
+            // Initialize database
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Get accounts to sync
+            let accounts_to_sync = if let Some(email) = account {
+                // Sync specific account
+                match db.get_account_by_email(&email).await? {
+                    Some(acc) if acc.is_active => vec![acc],
+                    Some(_) => {
+                        println!("Account {} is deactivated.", email);
+                        return Ok(());
+                    }
+                    None => {
+                        println!("Account {} not found. Run 'add-account' first.", email);
+                        return Ok(());
+                    }
+                }
+            } else {
+                // Get all active accounts
+                db.list_accounts().await?
+            };
+
+            // If no accounts configured, use legacy single-account mode
+            if accounts_to_sync.is_empty() {
+                println!("No accounts configured. Using legacy single-account mode.");
+                println!("Authenticating with Gmail...");
+                let gmail_client = auth::get_gmail_client(&client_secret, &token_cache).await?;
+
+                println!("Starting email sync (last {} days)...", days);
+                let stats = if let Some(custom_query) = query.clone() {
+                    ingestion::sync_emails_with_query(&db, gmail_client, &custom_query).await?
+                } else {
+                    ingestion::sync_emails_with_days(&db, gmail_client, days).await?
+                };
+
+                println!("\n{}", stats.summary());
+            } else {
+                // Sync each configured account
+                let mut total_fetched = 0;
+                let mut total_inserted = 0;
+
+                for acc in &accounts_to_sync {
+                    println!("\n=== Syncing account: {} ===", acc.email);
+
+                    let account_auth = AccountAuth::with_path(
+                        &acc.email,
+                        PathBuf::from(&acc.token_cache_path),
+                    );
+
+                    match auth::get_gmail_client_for_account(&client_secret, &account_auth).await {
+                        Ok(gmail_client) => {
+                            println!("Starting email sync (last {} days)...", days);
+                            let stats = if let Some(ref custom_query) = query {
+                                ingestion::sync_emails_with_query_and_account(
+                                    &db,
+                                    gmail_client,
+                                    custom_query,
+                                    acc.id,
+                                ).await?
+                            } else {
+                                ingestion::sync_emails_with_days_and_account(
+                                    &db,
+                                    gmail_client,
+                                    days,
+                                    acc.id,
+                                ).await?
+                            };
+
+                            println!("{}", stats.summary());
+                            total_fetched += stats.total_fetched;
+                            total_inserted += stats.new_emails;
+
+                            // Update last sync time
+                            db.update_account_last_sync(acc.id).await?;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to authenticate {}: {}", acc.email, e);
+                            eprintln!("Run 'clear-account-auth {}' and try again.", acc.email);
+                        }
+                    }
+                }
+
+                println!("\n=== Sync Complete ===");
+                println!("  Accounts synced: {}", accounts_to_sync.len());
+                println!("  Total fetched: {}", total_fetched);
+                println!("  Total new: {}", total_inserted);
+            }
+
+            // Show updated status
+            let status = ingestion::get_sync_status(&db).await?;
+            println!("\n{}", status);
+        }
+
+        Commands::Process { reset } => {
+            // Initialize database
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Optionally reset skipped/failed emails
+            if reset {
+                let count = db.reset_email_status().await?;
+                println!("Reset {} emails to pending status", count);
+            }
+
+            println!("Processing pending emails...");
+            let stats = process::process_pending_events(&db).await?;
+            println!("\n{}", stats.summary());
+
+            // Show order status
+            let order_status = get_order_status(&db).await?;
+            println!("\n{}", order_status);
+        }
+
+        Commands::Serve { port } => {
+            // Initialize database
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            println!("Starting web dashboard at http://localhost:{}", port);
+            web::serve(db, port).await?;
+        }
+
+        Commands::DebugEmail { id } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let query = match id {
+                Some(id) => format!("SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails WHERE id = {}", id),
+                None => "SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails LIMIT 1".to_string(),
+            };
+
+            let row: Option<(i64, String, Option<String>, String, String)> =
+                sqlx::query_as(&query)
+                    .fetch_optional(db.pool())
+                    .await?;
+
+            if let Some((id, gmail_id, subject, raw_body, event_type)) = row {
+                println!("=== Email ID: {} ===", id);
+                println!("Gmail ID: {}", gmail_id);
+                println!("Subject: {:?}", subject);
+                println!("Event Type: {}", event_type);
+                println!("Body length: {} chars", raw_body.len());
+
+                // Show if body is still quoted-printable encoded
+                if raw_body.contains("=3D") || raw_body.contains("=20") {
+                    println!("⚠ Body appears to still be quoted-printable encoded");
+                }
+
+                // Parse email using actual parser
+                let parser = walmart_dashboard::parsing::WalmartEmailParser::new();
+                let order_id = parser.extract_order_id(&raw_body);
+                let total = parser.extract_total_price(&raw_body);
+
+                println!("\n--- Parser results ---");
+                println!("  Order ID: {:?}", order_id);
+                println!("  Total: {:?}", total);
+
+                // If order exists, show current DB value
+                if let Ok(oid) = &order_id {
+                    let db_order: Option<(Option<f64>,)> = sqlx::query_as(
+                        "SELECT total_cost FROM orders WHERE id = ?"
+                    )
+                    .bind(oid)
+                    .fetch_optional(db.pool())
+                    .await?;
+
+                    if let Some((db_total,)) = db_order {
+                        println!("  DB Total: {:?}", db_total);
+                    } else {
+                        println!("  (Order not in DB)");
+                    }
+                }
+
+                println!("\n--- First 500 chars of body ---");
+                println!("{}", &raw_body[..std::cmp::min(500, raw_body.len())]);
+            } else {
+                println!("No email found");
+            }
+        }
+
+        Commands::ClearEmails => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let result = sqlx::query("DELETE FROM raw_emails")
+                .execute(db.pool())
+                .await?;
+
+            println!("Cleared {} emails from database", result.rows_affected());
+            println!("Run 'sync' to re-fetch emails from Gmail");
+        }
+
+        Commands::ClearOrders => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Clear line_items first (due to foreign key)
+            let items_result = sqlx::query("DELETE FROM line_items")
+                .execute(db.pool())
+                .await?;
+
+            // Clear orders
+            let orders_result = sqlx::query("DELETE FROM orders")
+                .execute(db.pool())
+                .await?;
+
+            // Reset all emails to pending
+            let _emails_reset = db.reset_email_status().await?;
+
+            // Also reset "processed" emails to "pending"
+            let processed_reset = sqlx::query(
+                "UPDATE raw_emails SET processing_status = 'pending', error_message = NULL, processed_at = NULL WHERE processing_status = 'processed'"
+            )
+            .execute(db.pool())
+            .await?;
+
+            // Re-infer event_type based on subject patterns (fixes classification for "Thanks for your order" emails)
+            sqlx::query(
+                r#"
+                UPDATE raw_emails SET event_type =
+                    CASE
+                        WHEN LOWER(subject) LIKE '%confirmed%' OR LOWER(subject) LIKE '%confirmation%' OR LOWER(subject) LIKE '%thanks for your%' THEN 'confirmation'
+                        WHEN LOWER(subject) LIKE '%cancel%' THEN 'cancellation'
+                        WHEN LOWER(subject) LIKE '%shipped%' OR LOWER(subject) LIKE '%on its way%' THEN 'shipping'
+                        WHEN LOWER(subject) LIKE '%delivered%' OR LOWER(subject) LIKE '%arrived%' THEN 'delivery'
+                        ELSE event_type
+                    END
+                "#
+            )
+            .execute(db.pool())
+            .await?;
+
+            println!("Cleared {} orders and {} line items", orders_result.rows_affected(), items_result.rows_affected());
+            println!("Reset {} processed emails to pending", processed_reset.rows_affected());
+            println!("Run 'process' to reprocess emails with updated parsing logic");
+        }
+
+        Commands::SearchEmails { pattern } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // First show processing status breakdown
+            let statuses: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT processing_status, COUNT(*) FROM raw_emails GROUP BY processing_status"
+            )
+            .fetch_all(db.pool())
+            .await?;
+
+            println!("Email processing status breakdown:");
+            for (status, count) in &statuses {
+                println!("  {}: {}", status, count);
+            }
+
+            // Search for emails matching the pattern
+            let search_pattern = format!("%{}%", pattern);
+            let rows: Vec<(i64, Option<String>, String, String)> = sqlx::query_as(
+                "SELECT id, subject, event_type, processing_status FROM raw_emails WHERE subject LIKE ? COLLATE NOCASE ORDER BY id DESC LIMIT 20"
+            )
+            .bind(&search_pattern)
+            .fetch_all(db.pool())
+            .await?;
+
+            println!("\nEmails matching '{}':", pattern);
+            if rows.is_empty() {
+                println!("  No emails found matching that pattern");
+            } else {
+                for (id, subject, event_type, status) in rows {
+                    println!("  [{}] {} | type: {} | status: {}",
+                        id,
+                        subject.unwrap_or_else(|| "(no subject)".to_string()),
+                        event_type,
+                        status
+                    );
+                }
+            }
+        }
+
+        Commands::DebugOrder { id } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Get order info (including tracking)
+            let order: Option<(String, String, Option<f64>, String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT id, order_date, total_cost, status, tracking_number, carrier FROM orders WHERE id = ?"
+            )
+            .bind(&id)
+            .fetch_optional(db.pool())
+            .await?;
+
+            if let Some((order_id, order_date, total, status, tracking, carrier)) = order {
+                println!("=== Order {} ===", order_id);
+                println!("  Date: {}", order_date);
+                println!("  Total: {:?}", total);
+                println!("  Status: {}", status);
+                if let (Some(t), Some(c)) = (&tracking, &carrier) {
+                    println!("  Tracking: {} ({})", t, c);
+                }
+
+                // Get line items
+                let items: Vec<(String, i32, String)> = sqlx::query_as(
+                    "SELECT name, quantity, status FROM line_items WHERE order_id = ?"
+                )
+                .bind(&id)
+                .fetch_all(db.pool())
+                .await?;
+
+                println!("\nLine items ({}):", items.len());
+                for (name, qty, item_status) in items {
+                    println!("  - {} (qty: {}) [{}]", name, qty, item_status);
+                }
+
+                // Get email events
+                let events: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+                    "SELECT id, event_type, email_subject FROM email_events WHERE order_id = ?"
+                )
+                .bind(&id)
+                .fetch_all(db.pool())
+                .await?;
+
+                println!("\nEmail events ({}):", events.len());
+                for (event_id, event_type, subject) in events {
+                    println!("  [{}] {} - {:?}", event_id, event_type, subject);
+                }
+            } else {
+                println!("Order {} not found", id);
+            }
+        }
+
+        Commands::CheckDelivery { dry_run: _ } => {
+            // FedEx tracking via API is no longer available due to Akamai Bot Manager protection.
+            // The Akamai sensor_data generation requires JavaScript execution which cannot be
+            // done programmatically without browser automation.
+            println!("FedEx delivery status checking is currently unavailable.");
+            println!();
+            println!("FedEx uses Akamai Bot Manager which requires browser-generated cookies.");
+            println!("To check delivery status, use one of these alternatives:");
+            println!("  1. Visit https://www.fedex.com/fedextrack/ in a browser");
+            println!("  2. Use browser automation (Playwright/Puppeteer)");
+            println!("  3. Use FedEx's official tracking API with an API key");
+            println!();
+            println!("The experimental Akamai code has been moved to src/tracking/akamai/");
+            println!("for reference, but it cannot generate valid sensor_data without JS execution.");
+            println!();
+            println!("TIP: Use 'fetch-tracking' command to get tracking status via 17track.net");
+        }
+
+        Commands::FetchTracking { order_id, force } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let service = tracking::TrackingService::new();
+
+            if let Some(order_id) = order_id {
+                // Fetch tracking for a specific order
+                let order: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT tracking_number, carrier FROM orders WHERE id = ?"
+                )
+                .bind(&order_id)
+                .fetch_optional(db.pool())
+                .await?;
+
+                match order {
+                    Some((Some(tracking_number), Some(carrier))) => {
+                        println!("Fetching tracking for order {} ({} - {})...", order_id, carrier, tracking_number);
+                        match service.get_tracking_status(&db, &tracking_number, &carrier, force).await {
+                            Ok(status) => {
+                                print_tracking_status(&status);
+                            }
+                            Err(e) => {
+                                eprintln!("Error fetching tracking: {}", e);
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        println!("Order {} has no tracking information", order_id);
+                    }
+                    None => {
+                        println!("Order {} not found", order_id);
+                    }
+                }
+            } else {
+                // Fetch tracking for all shipped orders without cached status
+                let orders: Vec<(String, String, String)> = sqlx::query_as(
+                    r#"
+                    SELECT o.id, o.tracking_number, o.carrier
+                    FROM orders o
+                    LEFT JOIN tracking_cache tc ON o.tracking_number = tc.tracking_number
+                    WHERE o.tracking_number IS NOT NULL
+                      AND o.carrier IS NOT NULL
+                      AND o.status IN ('shipped', 'delivered')
+                      AND (tc.id IS NULL OR ? = 1)
+                    ORDER BY o.order_date DESC
+                    LIMIT 20
+                    "#
+                )
+                .bind(force as i32)
+                .fetch_all(db.pool())
+                .await?;
+
+                if orders.is_empty() {
+                    println!("No orders with tracking numbers need fetching");
+                    return Ok(());
+                }
+
+                println!("Fetching tracking for {} orders...\n", orders.len());
+
+                for (order_id, tracking_number, carrier) in orders {
+                    print!("Order {} ({} - {})... ", order_id, carrier, tracking_number);
+                    match service.get_tracking_status(&db, &tracking_number, &carrier, force).await {
+                        Ok(status) => {
+                            println!("{}", status.state.display_name());
+                        }
+                        Err(e) => {
+                            println!("Error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::RefreshTracking { dry_run } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let service = tracking::TrackingService::new();
+
+            if dry_run {
+                println!("Dry run - checking for stale tracking entries...\n");
+            } else {
+                println!("Refreshing stale tracking entries...\n");
+            }
+
+            match service.refresh_stale_tracking(&db, dry_run).await {
+                Ok(result) => {
+                    println!("\nRefresh complete:");
+                    println!("  Updated: {}", result.updated);
+                    println!("  Errors:  {}", result.errors);
+                    println!("  Skipped: {} (too many consecutive errors)", result.skipped);
+                }
+                Err(e) => {
+                    eprintln!("Error refreshing tracking: {}", e);
+                }
+            }
+        }
+
+        Commands::TrackingStatus { order_id } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Get tracking for the order
+            let tracking_list = tracking::get_tracking_for_order(&db, &order_id).await?;
+
+            if tracking_list.is_empty() {
+                // Check if order exists
+                let order: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT tracking_number, carrier FROM orders WHERE id = ?"
+                )
+                .bind(&order_id)
+                .fetch_optional(db.pool())
+                .await?;
+
+                match order {
+                    Some((Some(tracking), Some(carrier))) => {
+                        println!("Order {} has tracking {} ({}) but no cached status yet.", order_id, tracking, carrier);
+                        println!("Run 'fetch-tracking --order-id {}' to fetch status.", order_id);
+                    }
+                    Some(_) => {
+                        println!("Order {} has no tracking information.", order_id);
+                    }
+                    None => {
+                        println!("Order {} not found.", order_id);
+                    }
+                }
+            } else {
+                println!("=== Tracking for Order {} ===\n", order_id);
+                for status in tracking_list {
+                    print_tracking_status(&status);
+                    println!();
+                }
+            }
+        }
+
+        // ==================== Account Management ====================
+
+        Commands::AddAccount { client_secret } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            println!("Adding a new Gmail account...");
+            println!("A browser window will open for authentication.\n");
+
+            // Trigger OAuth flow and get email
+            let (email, token_path) = auth::authenticate_new_account(&client_secret).await?;
+
+            // Check if account already exists
+            if let Some(existing) = db.get_account_by_email(&email).await? {
+                if existing.is_active {
+                    println!("Account {} is already configured.", email);
+                    return Ok(());
+                } else {
+                    // Reactivate the account
+                    sqlx::query("UPDATE accounts SET is_active = 1, token_cache_path = ? WHERE email = ?")
+                        .bind(token_path.to_string_lossy().to_string())
+                        .bind(&email)
+                        .execute(db.pool())
+                        .await?;
+                    println!("Reactivated account: {}", email);
+                    return Ok(());
+                }
+            }
+
+            // Add new account to database
+            let token_path_str = token_path.to_string_lossy().to_string();
+            db.add_account(&email, &token_path_str).await?;
+
+            println!("\nSuccessfully added account: {}", email);
+            println!("Token cached at: {}", token_path_str);
+            println!("\nRun 'sync' to fetch emails from this account.");
+        }
+
+        Commands::ListAccounts => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let accounts = db.list_accounts().await?;
+
+            if accounts.is_empty() {
+                println!("No Gmail accounts configured.");
+                println!("\nRun 'add-account' to add a Gmail account.");
+            } else {
+                println!("Configured Gmail accounts:\n");
+                for account in accounts {
+                    let sync_info = account.last_sync_at
+                        .map(|t| format!("Last sync: {}", t))
+                        .unwrap_or_else(|| "Never synced".to_string());
+
+                    // Get email/order counts for this account
+                    let email_count: (i64,) = sqlx::query_as(
+                        "SELECT COUNT(*) FROM raw_emails WHERE account_id = ?"
+                    )
+                    .bind(account.id)
+                    .fetch_one(db.pool())
+                    .await?;
+
+                    let order_count: (i64,) = sqlx::query_as(
+                        "SELECT COUNT(*) FROM orders WHERE account_id = ?"
+                    )
+                    .bind(account.id)
+                    .fetch_one(db.pool())
+                    .await?;
+
+                    println!("  {} (ID: {})", account.email, account.id);
+                    println!("    {} | {} emails | {} orders",
+                        sync_info, email_count.0, order_count.0);
+                    println!("    Token: {}", account.token_cache_path);
+                    println!();
+                }
+            }
+        }
+
+        Commands::RemoveAccount { email, delete_data } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let account = db.get_account_by_email(&email).await?;
+
+            match account {
+                Some(account) => {
+                    if delete_data {
+                        // Delete all data and the account
+                        let (orders, emails) = db.delete_account_data(account.id).await?;
+
+                        // Also delete the token cache file
+                        let token_path = std::path::Path::new(&account.token_cache_path);
+                        if token_path.exists() {
+                            std::fs::remove_file(token_path)?;
+                        }
+
+                        println!("Removed account: {}", email);
+                        println!("  Deleted {} orders and {} emails", orders, emails);
+                        println!("  Removed token cache");
+                    } else {
+                        // Just deactivate
+                        db.deactivate_account(&email).await?;
+                        println!("Deactivated account: {}", email);
+                        println!("  Data preserved. Use --delete-data to remove all data.");
+                    }
+                }
+                None => {
+                    println!("Account {} not found.", email);
+                }
+            }
+        }
+
+        Commands::ClearAccountAuth { email } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let account = db.get_account_by_email(&email).await?;
+
+            match account {
+                Some(account) => {
+                    let account_auth = AccountAuth::with_path(
+                        &account.email,
+                        PathBuf::from(&account.token_cache_path),
+                    );
+                    account_auth.clear_token()?;
+                    println!("Cleared OAuth token for: {}", email);
+                    println!("You will need to re-authenticate on next sync.");
+                }
+                None => {
+                    println!("Account {} not found.", email);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get order statistics for status display
+async fn get_order_status(db: &Database) -> Result<String> {
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM orders")
+        .fetch_one(db.pool())
+        .await?;
+
+    let by_status: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY status"
+    )
+    .fetch_all(db.pool())
+    .await?;
+
+    let with_total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM orders WHERE total_cost IS NOT NULL"
+    )
+    .fetch_one(db.pool())
+    .await?;
+
+    let mut result = format!("Order status:\n  Total orders: {}", total.0);
+    for (status, count) in by_status {
+        result.push_str(&format!("\n  {}: {}", status, count));
+    }
+
+    // Show how many orders have totals
+    let without_total = total.0 - with_total.0;
+    result.push_str(&format!("\n\n  With total: {}", with_total.0));
+    if without_total > 0 {
+        result.push_str(&format!("\n  Missing total: {} (no confirmation email)", without_total));
+    }
+
+    Ok(result)
+}
+
+/// Print tracking status in a formatted way
+fn print_tracking_status(status: &tracking::CachedTracking) {
+    println!("Tracking: {} ({})", status.tracking_number, status.carrier);
+    println!("  Status: {}", status.state.display_name());
+    if let Some(desc) = &status.state_description {
+        println!("  Latest: {}", desc);
+    }
+    if status.is_delivered {
+        if let Some(date) = &status.delivery_date {
+            println!("  Delivered: {}", date);
+        } else {
+            println!("  Delivered: Yes");
+        }
+    }
+    println!("  Last fetched: {}", status.last_fetched_at);
+    println!("  Fetch count: {}", status.fetch_count);
+
+    if let Some(error) = &status.last_error {
+        println!("  Last error: {}", error);
+        println!("  Consecutive errors: {}", status.consecutive_errors);
+    }
+
+    if !status.events.is_empty() {
+        println!("\n  Recent events:");
+        for (i, event) in status.events.iter().take(5).enumerate() {
+            let time = event.event_time_iso.as_ref()
+                .or(event.event_time.as_ref())
+                .map(|s| s.as_str())
+                .unwrap_or("Unknown time");
+            let location = event.location.as_ref()
+                .map(|s| format!(" @ {}", s))
+                .unwrap_or_default();
+            println!("    {}. [{}] {}{}", i + 1, time, event.description, location);
+        }
+        if status.events.len() > 5 {
+            println!("    ... and {} more events", status.events.len() - 5);
+        }
+    }
+}

@@ -1,0 +1,89 @@
+[workspace]
+members = [".", "src-tauri"]
+resolver = "2"
+
+[package]
+name = "walmart-dashboard"
+version = "0.1.0"
+edition = "2021"
+authors = ["Order Reconciler Team"]
+description = "High-performance dashboard to track Walmart orders from email parsing"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "walmart-cli"
+path = "src-cli/main.rs"
+
+[dependencies]
+# Web Framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+
+# Async utilities
+futures = "0.3"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
+
+# Templating
+askama = "0.12"
+askama_axum = "0.4"
+
+# HTML Parsing
+scraper = "0.18"
+regex = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Gmail API (using versions compatible with google-gmail1 v5)
+google-gmail1 = "5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+
+# Environment
+dotenvy = "0.15"
+
+# Cryptographic hashing for account token paths
+sha2 = "0.10"
+
+# Base64 decoding for email content
+base64 = "0.21"
+
+# MIME decoding (quoted-printable)
+quoted_printable = "0.5"
+
+# HTTP client with browser impersonation for anti-bot bypass
+# Use git versions to match track17-rs dependencies
+wreq = { git = "https://github.com/0x676e67/wreq", features = ["cookies", "json"] }
+wreq-util = { git = "https://github.com/0x676e67/wreq-util" }
+rand = "0.9.2"
+urlencoding = "2"
+
+# Tracking info from 17track.net (uses headless Chrome)
+track17-rs = { git = "https://github.com/Phrasing/track17-rs", branch = "main" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[patch.crates-io]
+wreq = { git = "https://github.com/0x676e67/wreq" }
