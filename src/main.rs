@@ -121,6 +121,13 @@ enum Commands {
 
     /// Debug: show account_id distribution in orders and emails
     DebugAccounts,
+
+    /// Associate orphan emails (NULL account_id) with an account
+    AssociateEmails {
+        /// Account ID to associate orphan emails with
+        #[arg(long)]
+        account_id: i64,
+    },
 }
 
 #[tokio::main]
@@ -605,6 +612,72 @@ async fn main() -> Result<()> {
             for (id, status, acc_id) in sample_orders {
                 println!("  {} [{}] account_id={:?}", id, status, acc_id);
             }
+        }
+
+        Commands::AssociateEmails { account_id } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Verify account exists
+            let account: Option<(String,)> = sqlx::query_as(
+                "SELECT email FROM accounts WHERE id = ?"
+            )
+            .bind(account_id)
+            .fetch_optional(db.pool())
+            .await?;
+
+            let email = match account {
+                Some((e,)) => e,
+                None => {
+                    println!("Error: Account ID {} not found", account_id);
+                    println!("\nUse 'list-accounts' to see available accounts.");
+                    return Ok(());
+                }
+            };
+
+            println!("Associating orphan emails with account: {} (id={})", email, account_id);
+
+            // Count orphan emails
+            let (orphan_count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM raw_emails WHERE account_id IS NULL"
+            )
+            .fetch_one(db.pool())
+            .await?;
+
+            if orphan_count == 0 {
+                println!("No orphan emails found (all emails already have account_id set).");
+                return Ok(());
+            }
+
+            // Update orphan emails
+            let result = sqlx::query(
+                "UPDATE raw_emails SET account_id = ? WHERE account_id IS NULL"
+            )
+            .bind(account_id)
+            .execute(db.pool())
+            .await?;
+
+            println!("Updated {} emails to account_id={}", result.rows_affected(), account_id);
+
+            // Also update orphan orders
+            let (orphan_orders,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM orders WHERE account_id IS NULL"
+            )
+            .fetch_one(db.pool())
+            .await?;
+
+            if orphan_orders > 0 {
+                let orders_result = sqlx::query(
+                    "UPDATE orders SET account_id = ? WHERE account_id IS NULL"
+                )
+                .bind(account_id)
+                .execute(db.pool())
+                .await?;
+
+                println!("Updated {} orders to account_id={}", orders_result.rows_affected(), account_id);
+            }
+
+            println!("\nDone! Run 'debug-accounts' to verify the changes.");
         }
     }
 
