@@ -2,6 +2,7 @@
 // Uses Tauri's invoke API to communicate with the Rust backend
 
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 // Global state
 let allOrders = [];
@@ -613,6 +614,12 @@ function escapeHtml(text) {
 document.addEventListener('DOMContentLoaded', () => {
     setupFilterListeners();
     loadDashboard();
+
+    // Listen for tracking sync complete event from backend
+    listen('tracking-sync-complete', () => {
+        console.log('Tracking sync complete, refreshing dashboard...');
+        loadDashboard();
+    });
 });
 
 // Auto-refresh every 60 seconds

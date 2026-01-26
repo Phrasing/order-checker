@@ -6,7 +6,7 @@ mod commands;
 use commands::AppState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use tracing_appender::rolling;
@@ -115,6 +115,7 @@ fn main() {
             // Clone for background task before moving into AppState
             let db_for_task = Arc::clone(&db);
             let tracking_service_for_task = tracking_service.clone();
+            let app_handle = app.handle().clone();
 
             app.manage(AppState {
                 db,
@@ -147,7 +148,18 @@ fn main() {
                     tracing::error!("Failed to refresh stale tracking: {}", e);
                 }
 
+                // Sync order status from tracking data (shipped -> delivered)
+                if let Err(e) = walmart_dashboard::tracking::sync_delivered_from_tracking(&db).await
+                {
+                    tracing::error!("Failed to sync delivered orders: {}", e);
+                }
+
                 tracing::info!("Background tracking fetch complete");
+
+                // Emit event to notify frontend that sync is complete
+                if let Err(e) = app_handle.emit("tracking-sync-complete", ()) {
+                    tracing::error!("Failed to emit tracking-sync-complete event: {}", e);
+                }
             });
 
             Ok(())

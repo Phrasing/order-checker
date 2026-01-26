@@ -1028,6 +1028,34 @@ pub async fn refresh_stale_tracking_batch(
     Ok(refreshed)
 }
 
+/// Sync order status to 'delivered' for orders where tracking shows delivered.
+/// Called after tracking data is fetched/refreshed on startup.
+pub async fn sync_delivered_from_tracking(db: &Database) -> Result<usize> {
+    let result = sqlx::query(
+        r#"
+        UPDATE orders
+        SET status = 'delivered'
+        WHERE status = 'shipped'
+        AND tracking_number IN (
+            SELECT tracking_number FROM tracking_cache WHERE is_delivered = 1
+        )
+        "#,
+    )
+    .execute(db.pool())
+    .await
+    .context("Failed to sync delivered orders from tracking")?;
+
+    let count = result.rows_affected() as usize;
+    if count > 0 {
+        tracing::info!(
+            "Synced {} orders to 'delivered' from tracking data",
+            count
+        );
+    }
+
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

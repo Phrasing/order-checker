@@ -11,8 +11,11 @@ use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
-/// Maximum concurrent email processing tasks
-const MAX_CONCURRENT_PROCESSING: usize = 5;
+/// Maximum concurrent email parsing tasks (CPU-bound, can be parallel)
+const MAX_CONCURRENT_PARSING: usize = 50;
+
+/// Maximum concurrent database write tasks (IO-bound, serialize to avoid lock contention)
+const MAX_CONCURRENT_DB_WRITES: usize = 1;
 
 /// Statistics from processing operation
 #[derive(Debug, Default)]
@@ -48,6 +51,16 @@ struct RawEmail {
     account_id: Option<i64>,
 }
 
+/// Parsed email result ready for database writes
+struct ParsedEmail {
+    id: i64,
+    gmail_id: String,
+    email_type: EmailType,
+    order: Option<WalmartOrder>,
+    html: String,
+    raw_email: RawEmail,
+}
+
 /// Process all pending emails and reconcile into orders
 pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
     let mut stats = ProcessStats::default();
@@ -62,30 +75,70 @@ pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
         return Ok(stats);
     }
 
-    tracing::info!("Processing {} pending emails with {} concurrent tasks",
-                   pending_emails.len(), MAX_CONCURRENT_PROCESSING);
+    tracing::info!("Processing {} pending emails (parsing: {}, db writes: {})",
+                   pending_emails.len(), MAX_CONCURRENT_PARSING, MAX_CONCURRENT_DB_WRITES);
 
-    // Process emails in parallel with bounded concurrency
-    let results: Vec<(i64, String, Result<ProcessResult, String>)> = stream::iter(pending_emails)
+    // PHASE 1: Parse all emails in parallel (CPU-bound, use blocking thread pool)
+    let parsed_emails: Vec<Result<ParsedEmail, (i64, String, String)>> = stream::iter(pending_emails)
         .map(|email| {
             let parser = Arc::clone(&parser);
-            let db = db;
             async move {
-                let result = match process_single_email(db, &parser, &email).await {
-                    Ok(r) => Ok(r),
-                    Err(e) => Err(format!("{:#}", e)),
-                };
-                (email.id, email.gmail_id.clone(), result)
+                // Offload synchronous parsing to blocking thread pool for TRUE parallelism
+                tokio::task::spawn_blocking(move || {
+                    parse_single_email(&parser, email)
+                })
+                .await
+                .unwrap_or_else(|e| Err((0, String::new(), format!("Task panicked: {}", e))))
             }
         })
-        .buffer_unordered(MAX_CONCURRENT_PROCESSING)
+        .buffer_unordered(MAX_CONCURRENT_PARSING)
         .collect()
         .await;
 
-    // Categorize results for batch updates
-    let mut processed_ids: Vec<i64> = Vec::new();
+    // Separate successes from failures
+    let mut to_process: Vec<ParsedEmail> = Vec::new();
+    let mut parse_failures: Vec<(i64, String)> = Vec::new();
     let mut skipped_ids: Vec<i64> = Vec::new();
-    let mut failed_entries: Vec<(i64, String)> = Vec::new();
+
+    for result in parsed_emails {
+        match result {
+            Ok(parsed) => {
+                if parsed.email_type == EmailType::Unknown {
+                    skipped_ids.push(parsed.id);
+                    stats.skipped += 1;
+                } else {
+                    to_process.push(parsed);
+                }
+            }
+            Err((id, _gmail_id, error)) => {
+                parse_failures.push((id, error));
+                stats.failed += 1;
+            }
+        }
+    }
+
+    tracing::info!("Parsed {} emails: {} to process, {} skipped, {} failed",
+                   stats.total_pending, to_process.len(), stats.skipped, stats.failed);
+
+    // PHASE 2: Write to database sequentially (avoid lock contention)
+    let results: Vec<(i64, String, Result<ProcessResult, String>)> = stream::iter(to_process)
+        .map(|parsed| {
+            let db = db;
+            async move {
+                let result = match apply_parsed_email_to_db(db, &parsed).await {
+                    Ok(r) => Ok(r),
+                    Err(e) => Err(format!("{:#}", e)),
+                };
+                (parsed.id, parsed.gmail_id.clone(), result)
+            }
+        })
+        .buffer_unordered(MAX_CONCURRENT_DB_WRITES)
+        .collect()
+        .await;
+
+    // Categorize DB write results (parsing results already categorized above)
+    let mut processed_ids: Vec<i64> = Vec::new();
+    let mut db_failed_entries: Vec<(i64, String)> = Vec::new();
 
     for (id, gmail_id, result) in results {
         match result {
@@ -95,17 +148,21 @@ pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
                 tracing::debug!("Processed email {}", gmail_id);
             }
             Ok(ProcessResult::Skipped(reason)) => {
-                stats.skipped += 1;
+                // Shouldn't happen since we filter Unknown types before DB phase
                 skipped_ids.push(id);
                 tracing::debug!("Skipped email {}: {}", gmail_id, reason);
             }
             Err(error_msg) => {
                 stats.failed += 1;
-                failed_entries.push((id, error_msg.clone()));
+                db_failed_entries.push((id, error_msg.clone()));
                 tracing::warn!("Failed to process email {}: {}", gmail_id, error_msg);
             }
         }
     }
+
+    // Combine parse failures with DB failures
+    let mut all_failed: Vec<(i64, String)> = parse_failures;
+    all_failed.extend(db_failed_entries);
 
     // Batch update email statuses
     if !processed_ids.is_empty() {
@@ -114,8 +171,8 @@ pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
     if !skipped_ids.is_empty() {
         batch_mark_emails_skipped(db, &skipped_ids).await?;
     }
-    if !failed_entries.is_empty() {
-        batch_mark_emails_failed(db, &failed_entries).await?;
+    if !all_failed.is_empty() {
+        batch_mark_emails_failed(db, &all_failed).await?;
     }
 
     tracing::info!("{}", stats.summary());
@@ -183,7 +240,78 @@ fn decode_quoted_printable(input: &str) -> String {
     }
 }
 
-/// Process a single email and apply reconciliation logic
+/// Parse a single email without writing to DB (CPU-bound, parallelizable)
+fn parse_single_email(
+    parser: &WalmartEmailParser,
+    email: RawEmail,
+) -> Result<ParsedEmail, (i64, String, String)> {
+    // Decode quoted-printable encoding if present
+    let needs_decode = email.raw_body.contains("=20") || email.raw_body.contains("=3D");
+    let html = if needs_decode {
+        decode_quoted_printable(&email.raw_body)
+    } else {
+        email.raw_body.clone()
+    };
+
+    // Detect email type from the decoded HTML
+    let email_type = parser.detect_email_type(&html);
+
+    // Parse order if it's a known type
+    let order = if email_type != EmailType::Unknown {
+        match parser.parse_order(&html) {
+            Ok(mut order) => {
+                order.account_id = email.account_id;
+                Some(order)
+            }
+            Err(e) => {
+                return Err((email.id, email.gmail_id.clone(), format!("{:#}", e)));
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(ParsedEmail {
+        id: email.id,
+        gmail_id: email.gmail_id.clone(),
+        email_type,
+        order,
+        html,
+        raw_email: email,
+    })
+}
+
+/// Apply a parsed email to the database (IO-bound, should be serialized)
+async fn apply_parsed_email_to_db(
+    db: &Database,
+    parsed: &ParsedEmail,
+) -> Result<ProcessResult> {
+    let order = parsed.order.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No order data for non-unknown email type"))?;
+
+    match parsed.email_type {
+        EmailType::Unknown => {
+            return Ok(ProcessResult::Skipped("Unknown email type".to_string()));
+        }
+        EmailType::Confirmation => {
+            apply_confirmation(db, order, &parsed.raw_email).await?;
+        }
+        EmailType::Cancellation => {
+            apply_cancellation(db, order, &parsed.raw_email).await?;
+        }
+        EmailType::Shipping => {
+            apply_shipping(db, order, &parsed.raw_email).await?;
+        }
+        EmailType::Delivery => {
+            apply_delivery(db, order, &parsed.raw_email).await?;
+        }
+    }
+
+    Ok(ProcessResult::Processed)
+}
+
+/// Process a single email and apply reconciliation logic (legacy, for compatibility)
+#[allow(dead_code)]
 async fn process_single_email(
     db: &Database,
     parser: &WalmartEmailParser,
@@ -231,7 +359,31 @@ async fn process_single_email(
     Ok(ProcessResult::Processed)
 }
 
-/// Process a confirmation email - insert new order
+/// Apply a confirmation to the database (pre-parsed order)
+async fn apply_confirmation(
+    db: &Database,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
+    // Check if order already exists
+    if order_exists(db, &order.id).await? {
+        // Update with any new information (items, total)
+        update_order_from_confirmation(db, order).await?;
+        tracing::debug!("Updated existing order {}", order.id);
+    } else {
+        // Insert new order
+        insert_order(db, order).await?;
+        tracing::info!("Created new order {} with {} items", order.id, order.items.len());
+    }
+
+    // Record the email event
+    record_email_event(db, &order.id, "confirmation", email).await?;
+
+    Ok(())
+}
+
+/// Process a confirmation email - insert new order (legacy)
+#[allow(dead_code)]
 async fn process_confirmation(
     db: &Database,
     parser: &WalmartEmailParser,
@@ -244,41 +396,20 @@ async fn process_confirmation(
     // Set account_id from the email source
     order.account_id = email.account_id;
 
-    // Check if order already exists
-    if order_exists(db, &order.id).await? {
-        // Update with any new information (items, total)
-        update_order_from_confirmation(db, &order).await?;
-        tracing::debug!("Updated existing order {}", order.id);
-    } else {
-        // Insert new order
-        insert_order(db, &order).await?;
-        tracing::info!("Created new order {} with {} items", order.id, order.items.len());
-    }
-
-    // Record the email event
-    record_email_event(db, &order.id, "confirmation", email).await?;
-
-    Ok(())
+    apply_confirmation(db, &order, email).await
 }
 
-/// Process a cancellation email - update order/items status
-async fn process_cancellation(
+/// Apply a cancellation to the database (pre-parsed order)
+async fn apply_cancellation(
     db: &Database,
-    parser: &WalmartEmailParser,
-    html: &str,
+    order: &WalmartOrder,
     email: &RawEmail,
 ) -> Result<()> {
-    let mut order = parser.parse_order(html)
-        .context("Failed to parse cancellation email")?;
-
-    // Set account_id from the email source
-    order.account_id = email.account_id;
-
     // Order must exist for cancellation to apply
     if !order_exists(db, &order.id).await? {
         tracing::warn!("Cancellation for unknown order {}, creating placeholder", order.id);
         // Create a placeholder order so we can track the cancellation
-        insert_order(db, &order).await?;
+        insert_order(db, order).await?;
     }
 
     // Mark items as canceled if they match
@@ -308,22 +439,32 @@ async fn process_cancellation(
     Ok(())
 }
 
-/// Process a shipping email - update order/items status
-async fn process_shipping(
+/// Process a cancellation email - update order/items status (legacy)
+#[allow(dead_code)]
+async fn process_cancellation(
     db: &Database,
     parser: &WalmartEmailParser,
     html: &str,
     email: &RawEmail,
 ) -> Result<()> {
     let mut order = parser.parse_order(html)
-        .context("Failed to parse shipping email")?;
+        .context("Failed to parse cancellation email")?;
 
     // Set account_id from the email source
     order.account_id = email.account_id;
 
+    apply_cancellation(db, &order, email).await
+}
+
+/// Apply a shipping notification to the database (pre-parsed order)
+async fn apply_shipping(
+    db: &Database,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
     if !order_exists(db, &order.id).await? {
         // Create placeholder order
-        insert_order(db, &order).await?;
+        insert_order(db, order).await?;
     }
 
     // Update order status to shipped
@@ -355,22 +496,32 @@ async fn process_shipping(
     Ok(())
 }
 
-/// Process a delivery email - update order status to delivered
-async fn process_delivery(
+/// Process a shipping email - update order/items status (legacy)
+#[allow(dead_code)]
+async fn process_shipping(
     db: &Database,
     parser: &WalmartEmailParser,
     html: &str,
     email: &RawEmail,
 ) -> Result<()> {
     let mut order = parser.parse_order(html)
-        .context("Failed to parse delivery email")?;
+        .context("Failed to parse shipping email")?;
 
     // Set account_id from the email source
     order.account_id = email.account_id;
 
+    apply_shipping(db, &order, email).await
+}
+
+/// Apply a delivery notification to the database (pre-parsed order)
+async fn apply_delivery(
+    db: &Database,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
     if !order_exists(db, &order.id).await? {
         // Create placeholder order
-        insert_order(db, &order).await?;
+        insert_order(db, order).await?;
     }
 
     // Update order status to delivered
@@ -387,6 +538,23 @@ async fn process_delivery(
 
     tracing::info!("Order {} marked as delivered", order.id);
     Ok(())
+}
+
+/// Process a delivery email - update order status to delivered (legacy)
+#[allow(dead_code)]
+async fn process_delivery(
+    db: &Database,
+    parser: &WalmartEmailParser,
+    html: &str,
+    email: &RawEmail,
+) -> Result<()> {
+    let mut order = parser.parse_order(html)
+        .context("Failed to parse delivery email")?;
+
+    // Set account_id from the email source
+    order.account_id = email.account_id;
+
+    apply_delivery(db, &order, email).await
 }
 
 // ============================================================================
