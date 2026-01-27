@@ -8,9 +8,10 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
 use walmart_dashboard::db::Database;
+use walmart_dashboard::process;
 use walmart_dashboard::tracking::{self, TrackingService};
 use walmart_dashboard::web::{
-    AccountViewModel, DashboardData, fetch_account_view_models, get_dashboard_data_filtered,
+    AccountViewModel, DashboardData, fetch_account_view_models, get_dashboard_data_with_dates,
 };
 
 /// Application state managed by Tauri
@@ -22,15 +23,24 @@ pub struct AppState {
 
 /// Get dashboard data for the frontend
 /// If account_id is provided, filters data to that account only
+/// If start_date/end_date are provided (in "YYYY-MM-DD" format), filters by date range
 #[tauri::command]
 pub async fn get_dashboard(
     state: State<'_, AppState>,
     account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
 ) -> Result<DashboardData, String> {
     let db = state.db.lock().await;
-    get_dashboard_data_filtered(&db, account_id)
-        .await
-        .map_err(|e| e.to_string())
+
+    get_dashboard_data_with_dates(
+        &db,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Refresh dashboard data (same as get_dashboard, provided for semantic clarity)
@@ -38,8 +48,10 @@ pub async fn get_dashboard(
 pub async fn refresh_dashboard(
     state: State<'_, AppState>,
     account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
 ) -> Result<DashboardData, String> {
-    get_dashboard(state, account_id).await
+    get_dashboard(state, account_id, start_date, end_date).await
 }
 
 /// List all configured accounts
@@ -208,4 +220,42 @@ pub async fn restart_tracking_session(
         .map_err(|e| e.to_string())?;
 
     Ok("Tracking session restarted successfully".to_string())
+}
+
+// ==================== Process Commands ====================
+
+/// Result from processing pending emails
+#[derive(Serialize)]
+pub struct ProcessResult {
+    pub success: bool,
+    pub pending: usize,
+    pub processed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub message: String,
+}
+
+/// Process pending emails into orders
+/// Use this after syncing emails via CLI to update orders
+#[tauri::command]
+pub async fn process_emails(
+    state: State<'_, AppState>,
+) -> Result<ProcessResult, String> {
+    let db = state.db.lock().await;
+
+    let stats = process::process_pending_events(&db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(ProcessResult {
+        success: true,
+        pending: stats.total_pending,
+        processed: stats.processed,
+        failed: stats.failed,
+        skipped: stats.skipped,
+        message: format!(
+            "Processed {} of {} pending emails ({} failed, {} skipped)",
+            stats.processed, stats.total_pending, stats.failed, stats.skipped
+        ),
+    })
 }

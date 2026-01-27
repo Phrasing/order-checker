@@ -50,6 +50,7 @@ impl Database {
             include_str!("../../migrations/003_tracking_info.sql"),
             include_str!("../../migrations/004_tracking_cache.sql"),
             include_str!("../../migrations/005_accounts.sql"),
+            include_str!("../../migrations/006_fix_line_items_duplicates.sql"),
         ];
 
         for (i, migration_sql) in migrations.iter().enumerate() {

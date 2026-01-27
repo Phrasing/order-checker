@@ -96,8 +96,9 @@ impl WalmartEmailParser {
             ).expect("Invalid price class regex"),
 
             // Common date formats in Walmart emails
+            // Format found: "Order date: Thu, Jan 22, 2026" - need to skip optional day-of-week prefix
             date_pattern: Regex::new(
-                r"(?i)(?:ordered\s+on|order\s+date|placed\s+on)[:\s]*(\w+\s+\d{1,2},?\s+\d{4})"
+                r"(?i)(?:ordered\s+on|order\s+date|placed\s+on)[:\s]*(?:\w+,\s+)?(\w+\s+\d{1,2},?\s+\d{4})"
             ).expect("Invalid date regex"),
 
             // Pattern to extract items from img alt attributes in shipping emails

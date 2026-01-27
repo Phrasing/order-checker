@@ -9,12 +9,21 @@ use crate::parsing::{EmailType, WalmartEmailParser};
 use crate::tracking::create_tracking_cache_entry;
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
+use sqlx::Sqlite;
 use std::sync::Arc;
+
+/// Tracking info to create after transaction commits
+struct PendingTrackingEntry {
+    order_id: String,
+    tracking_number: String,
+    carrier: String,
+}
 
 /// Maximum concurrent email parsing tasks (CPU-bound, can be parallel)
 const MAX_CONCURRENT_PARSING: usize = 50;
 
-/// Maximum concurrent database write tasks (IO-bound, serialize to avoid lock contention)
+/// Maximum concurrent database write tasks (unused - now using single transaction)
+#[allow(dead_code)]
 const MAX_CONCURRENT_DB_WRITES: usize = 1;
 
 /// Statistics from processing operation
@@ -120,43 +129,43 @@ pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
     tracing::info!("Parsed {} emails: {} to process, {} skipped, {} failed",
                    stats.total_pending, to_process.len(), stats.skipped, stats.failed);
 
-    // PHASE 2: Write to database sequentially (avoid lock contention)
-    let results: Vec<(i64, String, Result<ProcessResult, String>)> = stream::iter(to_process)
-        .map(|parsed| {
-            let db = db;
-            async move {
-                let result = match apply_parsed_email_to_db(db, &parsed).await {
-                    Ok(r) => Ok(r),
-                    Err(e) => Err(format!("{:#}", e)),
-                };
-                (parsed.id, parsed.gmail_id.clone(), result)
-            }
-        })
-        .buffer_unordered(MAX_CONCURRENT_DB_WRITES)
-        .collect()
-        .await;
-
-    // Categorize DB write results (parsing results already categorized above)
+    // PHASE 2: Write to database in a SINGLE TRANSACTION (eliminates lock contention)
     let mut processed_ids: Vec<i64> = Vec::new();
     let mut db_failed_entries: Vec<(i64, String)> = Vec::new();
+    let mut pending_tracking: Vec<PendingTrackingEntry> = Vec::new();
 
-    for (id, gmail_id, result) in results {
+    // Begin transaction for all DB writes
+    let mut tx = db.pool().begin().await.context("Failed to begin transaction")?;
+
+    for parsed in &to_process {
+        let result = apply_parsed_email_to_db_tx(&mut tx, parsed, &mut pending_tracking).await;
         match result {
             Ok(ProcessResult::Processed) => {
                 stats.processed += 1;
-                processed_ids.push(id);
-                tracing::debug!("Processed email {}", gmail_id);
+                processed_ids.push(parsed.id);
+                tracing::debug!("Processed email {}", parsed.gmail_id);
             }
             Ok(ProcessResult::Skipped(reason)) => {
-                // Shouldn't happen since we filter Unknown types before DB phase
-                skipped_ids.push(id);
-                tracing::debug!("Skipped email {}: {}", gmail_id, reason);
+                skipped_ids.push(parsed.id);
+                tracing::debug!("Skipped email {}: {}", parsed.gmail_id, reason);
             }
-            Err(error_msg) => {
+            Err(e) => {
+                let error_msg = format!("{:#}", e);
                 stats.failed += 1;
-                db_failed_entries.push((id, error_msg.clone()));
-                tracing::warn!("Failed to process email {}: {}", gmail_id, error_msg);
+                db_failed_entries.push((parsed.id, error_msg.clone()));
+                tracing::warn!("Failed to process email {}: {}", parsed.gmail_id, error_msg);
             }
+        }
+    }
+
+    // Commit the transaction
+    tx.commit().await.context("Failed to commit transaction")?;
+    tracing::info!("Committed {} order updates in single transaction", stats.processed);
+
+    // Create tracking cache entries AFTER transaction commits (non-critical)
+    for entry in pending_tracking {
+        if let Err(e) = create_tracking_cache_entry(db, &entry.order_id, &entry.tracking_number, &entry.carrier).await {
+            tracing::warn!("Failed to create tracking cache entry for {}: {}", entry.tracking_number, e);
         }
     }
 
@@ -310,6 +319,36 @@ async fn apply_parsed_email_to_db(
     Ok(ProcessResult::Processed)
 }
 
+/// Apply a parsed email to the database within a transaction
+async fn apply_parsed_email_to_db_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    parsed: &ParsedEmail,
+    pending_tracking: &mut Vec<PendingTrackingEntry>,
+) -> Result<ProcessResult> {
+    let order = parsed.order.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No order data for non-unknown email type"))?;
+
+    match parsed.email_type {
+        EmailType::Unknown => {
+            return Ok(ProcessResult::Skipped("Unknown email type".to_string()));
+        }
+        EmailType::Confirmation => {
+            apply_confirmation_tx(tx, order, &parsed.raw_email).await?;
+        }
+        EmailType::Cancellation => {
+            apply_cancellation_tx(tx, order, &parsed.raw_email).await?;
+        }
+        EmailType::Shipping => {
+            apply_shipping_tx(tx, order, &parsed.raw_email, pending_tracking).await?;
+        }
+        EmailType::Delivery => {
+            apply_delivery_tx(tx, order, &parsed.raw_email).await?;
+        }
+    }
+
+    Ok(ProcessResult::Processed)
+}
+
 /// Process a single email and apply reconciliation logic (legacy, for compatibility)
 #[allow(dead_code)]
 async fn process_single_email(
@@ -365,16 +404,11 @@ async fn apply_confirmation(
     order: &WalmartOrder,
     email: &RawEmail,
 ) -> Result<()> {
-    // Check if order already exists
-    if order_exists(db, &order.id).await? {
-        // Update with any new information (items, total)
-        update_order_from_confirmation(db, order).await?;
-        tracing::debug!("Updated existing order {}", order.id);
-    } else {
-        // Insert new order
-        insert_order(db, order).await?;
-        tracing::info!("Created new order {} with {} items", order.id, order.items.len());
-    }
+    // INSERT OR IGNORE handles duplicates - no need to check order_exists first
+    insert_order(db, order).await?;
+
+    // Update with any new information (items, total) - harmless if order was just created
+    update_order_from_confirmation(db, order).await?;
 
     // Record the email event
     record_email_event(db, &order.id, "confirmation", email).await?;
@@ -405,12 +439,8 @@ async fn apply_cancellation(
     order: &WalmartOrder,
     email: &RawEmail,
 ) -> Result<()> {
-    // Order must exist for cancellation to apply
-    if !order_exists(db, &order.id).await? {
-        tracing::warn!("Cancellation for unknown order {}, creating placeholder", order.id);
-        // Create a placeholder order so we can track the cancellation
-        insert_order(db, order).await?;
-    }
+    // Ensure order exists (INSERT OR IGNORE handles duplicates)
+    insert_order(db, order).await?;
 
     // Mark items as canceled if they match
     if order.items.is_empty() {
@@ -462,10 +492,8 @@ async fn apply_shipping(
     order: &WalmartOrder,
     email: &RawEmail,
 ) -> Result<()> {
-    if !order_exists(db, &order.id).await? {
-        // Create placeholder order
-        insert_order(db, order).await?;
-    }
+    // Ensure order exists (INSERT OR IGNORE handles duplicates)
+    insert_order(db, order).await?;
 
     // Update order status to shipped
     update_order_status(db, &order.id, OrderStatus::Shipped).await?;
@@ -519,10 +547,8 @@ async fn apply_delivery(
     order: &WalmartOrder,
     email: &RawEmail,
 ) -> Result<()> {
-    if !order_exists(db, &order.id).await? {
-        // Create placeholder order
-        insert_order(db, order).await?;
-    }
+    // Ensure order exists (INSERT OR IGNORE handles duplicates)
+    insert_order(db, order).await?;
 
     // Update order status to delivered
     update_order_status(db, &order.id, OrderStatus::Delivered).await?;
@@ -555,6 +581,104 @@ async fn process_delivery(
     order.account_id = email.account_id;
 
     apply_delivery(db, &order, email).await
+}
+
+// ============================================================================
+// Transaction-aware apply functions for batched processing
+// ============================================================================
+
+/// Apply a confirmation to the database within a transaction
+async fn apply_confirmation_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
+    insert_order_tx(tx, order).await?;
+    update_order_from_confirmation_tx(tx, order).await?;
+    record_email_event_tx(tx, &order.id, "confirmation", email).await?;
+    Ok(())
+}
+
+/// Apply a cancellation to the database within a transaction
+async fn apply_cancellation_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
+    insert_order_tx(tx, order).await?;
+
+    if order.items.is_empty() {
+        update_order_status_tx(tx, &order.id, OrderStatus::Canceled).await?;
+        cancel_all_items_tx(tx, &order.id).await?;
+        tracing::info!("Order {} fully canceled", order.id);
+    } else {
+        let item_names: Vec<&str> = order.items.iter().map(|i| i.name.as_str()).collect();
+        batch_cancel_items_by_name_tx(tx, &order.id, &item_names).await?;
+
+        let all_canceled = check_all_items_canceled_tx(tx, &order.id).await?;
+        if all_canceled {
+            update_order_status_tx(tx, &order.id, OrderStatus::Canceled).await?;
+        } else {
+            update_order_status_tx(tx, &order.id, OrderStatus::PartiallyCanceled).await?;
+        }
+        tracing::info!("Order {} partially canceled ({} items)", order.id, item_names.len());
+    }
+
+    record_email_event_tx(tx, &order.id, "cancellation", email).await?;
+    Ok(())
+}
+
+/// Apply a shipping notification to the database within a transaction
+async fn apply_shipping_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+    email: &RawEmail,
+    pending_tracking: &mut Vec<PendingTrackingEntry>,
+) -> Result<()> {
+    insert_order_tx(tx, order).await?;
+    update_order_status_tx(tx, &order.id, OrderStatus::Shipped).await?;
+
+    if let (Some(tracking), Some(carrier)) = (&order.tracking_number, &order.carrier) {
+        update_order_tracking_tx(tx, &order.id, tracking, carrier).await?;
+
+        // Queue tracking cache creation for after transaction commits
+        pending_tracking.push(PendingTrackingEntry {
+            order_id: order.id.clone(),
+            tracking_number: tracking.clone(),
+            carrier: carrier.clone(),
+        });
+
+        tracing::info!("Order {} shipped via {} - tracking: {}", order.id, carrier, tracking);
+    } else {
+        tracing::info!("Order {} marked as shipped (no tracking number)", order.id);
+    }
+
+    if !order.items.is_empty() {
+        let item_names: Vec<&str> = order.items.iter().map(|i| i.name.as_str()).collect();
+        batch_update_item_status_tx(tx, &order.id, &item_names, ItemStatus::Shipped).await?;
+    }
+
+    record_email_event_tx(tx, &order.id, "shipping", email).await?;
+    Ok(())
+}
+
+/// Apply a delivery notification to the database within a transaction
+async fn apply_delivery_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+    email: &RawEmail,
+) -> Result<()> {
+    insert_order_tx(tx, order).await?;
+    update_order_status_tx(tx, &order.id, OrderStatus::Delivered).await?;
+
+    if !order.items.is_empty() {
+        let item_names: Vec<&str> = order.items.iter().map(|i| i.name.as_str()).collect();
+        batch_update_item_status_tx(tx, &order.id, &item_names, ItemStatus::Delivered).await?;
+    }
+
+    record_email_event_tx(tx, &order.id, "delivery", email).await?;
+    tracing::info!("Order {} marked as delivered", order.id);
+    Ok(())
 }
 
 // ============================================================================
@@ -617,43 +741,29 @@ async fn insert_order(db: &Database, order: &WalmartOrder) -> Result<()> {
 async fn update_order_from_confirmation(db: &Database, order: &WalmartOrder) -> Result<()> {
     // Update total if we have it
     if order.total_cost.is_some() {
-        tracing::info!("Updating order {} with total {:?}", order.id, order.total_cost);
-        let result = sqlx::query("UPDATE orders SET total_cost = ? WHERE id = ?")
+        sqlx::query("UPDATE orders SET total_cost = ? WHERE id = ?")
             .bind(order.total_cost)
             .bind(&order.id)
             .execute(db.pool())
             .await?;
-        tracing::info!("Update affected {} rows", result.rows_affected());
-    } else {
-        tracing::debug!("No total cost to update for order {}", order.id);
     }
 
-    // Add any new items that don't exist
+    // Add any new items using INSERT OR IGNORE (eliminates N+1 SELECT queries)
     for item in &order.items {
-        let exists: Option<(i32,)> = sqlx::query_as(
-            "SELECT 1 FROM line_items WHERE order_id = ? AND name = ? LIMIT 1"
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO line_items (order_id, name, quantity, price, image_url, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#
         )
         .bind(&order.id)
         .bind(&item.name)
-        .fetch_optional(db.pool())
+        .bind(item.quantity as i32)
+        .bind(item.price)
+        .bind(&item.image_url)
+        .bind(item.status.as_str())
+        .execute(db.pool())
         .await?;
-
-        if exists.is_none() {
-            sqlx::query(
-                r#"
-                INSERT INTO line_items (order_id, name, quantity, price, image_url, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-                "#
-            )
-            .bind(&order.id)
-            .bind(&item.name)
-            .bind(item.quantity as i32)
-            .bind(item.price)
-            .bind(&item.image_url)
-            .bind(item.status.as_str())
-            .execute(db.pool())
-            .await?;
-        }
     }
 
     Ok(())
@@ -787,18 +897,220 @@ async fn record_email_event(
     event_type: &str,
     email: &RawEmail,
 ) -> Result<()> {
+    // Note: raw_html is NULL because it's already stored in raw_emails table
+    // Storing it again would be redundant and slow (50-150KB per email)
     sqlx::query(
         r#"
         INSERT INTO email_events (order_id, event_type, email_subject, email_date, raw_html)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, NULL)
         "#
     )
     .bind(order_id)
     .bind(event_type)
     .bind(&email.subject)
     .bind(&email.gmail_date)
-    .bind(&email.raw_body)
     .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+// ============================================================================
+// Transaction-aware database helper functions
+// ============================================================================
+
+async fn insert_order_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO orders (id, order_date, total_cost, status, tracking_number, carrier, account_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#
+    )
+    .bind(&order.id)
+    .bind(order.order_date.to_rfc3339())
+    .bind(order.total_cost)
+    .bind(order.status.as_str())
+    .bind(&order.tracking_number)
+    .bind(&order.carrier)
+    .bind(order.account_id)
+    .execute(&mut **tx)
+    .await
+    .context("Failed to insert order")?;
+
+    for item in &order.items {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO line_items (order_id, name, quantity, price, image_url, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(&order.id)
+        .bind(&item.name)
+        .bind(item.quantity as i32)
+        .bind(item.price)
+        .bind(&item.image_url)
+        .bind(item.status.as_str())
+        .execute(&mut **tx)
+        .await
+        .context("Failed to insert line item")?;
+    }
+
+    Ok(())
+}
+
+async fn update_order_from_confirmation_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order: &WalmartOrder,
+) -> Result<()> {
+    if order.total_cost.is_some() {
+        sqlx::query("UPDATE orders SET total_cost = ? WHERE id = ?")
+            .bind(order.total_cost)
+            .bind(&order.id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    for item in &order.items {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO line_items (order_id, name, quantity, price, image_url, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(&order.id)
+        .bind(&item.name)
+        .bind(item.quantity as i32)
+        .bind(item.price)
+        .bind(&item.image_url)
+        .bind(item.status.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn update_order_status_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    status: OrderStatus,
+) -> Result<()> {
+    sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+        .bind(status.as_str())
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn update_order_tracking_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    tracking_number: &str,
+    carrier: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE orders SET tracking_number = ?, carrier = ? WHERE id = ?")
+        .bind(tracking_number)
+        .bind(carrier)
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn cancel_all_items_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE line_items SET status = 'canceled' WHERE order_id = ?")
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn batch_update_item_status_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    item_names: &[&str],
+    status: ItemStatus,
+) -> Result<()> {
+    if item_names.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders: Vec<&str> = item_names.iter().map(|_| "?").collect();
+    let query = format!(
+        "UPDATE line_items SET status = ? WHERE order_id = ? AND name IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&query)
+        .bind(status.as_str())
+        .bind(order_id);
+    for name in item_names {
+        q = q.bind(*name);
+    }
+    q.execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn batch_cancel_items_by_name_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    item_names: &[&str],
+) -> Result<()> {
+    if item_names.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders: Vec<&str> = item_names.iter().map(|_| "?").collect();
+    let query = format!(
+        "UPDATE line_items SET status = 'canceled' WHERE order_id = ? AND name IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&query).bind(order_id);
+    for name in item_names {
+        q = q.bind(*name);
+    }
+    q.execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn check_all_items_canceled_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+) -> Result<bool> {
+    let non_canceled: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM line_items WHERE order_id = ? AND status != 'canceled'"
+    )
+    .bind(order_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(non_canceled.0 == 0)
+}
+
+async fn record_email_event_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    event_type: &str,
+    email: &RawEmail,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO email_events (order_id, event_type, email_subject, email_date, raw_html)
+        VALUES (?, ?, ?, ?, NULL)
+        "#
+    )
+    .bind(order_id)
+    .bind(event_type)
+    .bind(&email.subject)
+    .bind(&email.gmail_date)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }

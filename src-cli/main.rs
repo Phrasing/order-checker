@@ -76,6 +76,9 @@ enum Commands {
         /// Email ID to dump (default: first pending)
         #[arg(short, long)]
         id: Option<i64>,
+        /// Filter by event type (order_confirmation, shipping, delivery, cancellation)
+        #[arg(short = 't', long)]
+        event_type: Option<String>,
     },
 
     /// Clear all raw emails from the database (for resync)
@@ -156,6 +159,15 @@ enum Commands {
         /// Email address of the account
         email: String,
     },
+
+    // ==================== Data Maintenance ====================
+
+    /// Fix order dates by re-extracting from raw emails
+    FixDates {
+        /// Dry run - don't update database, just show what would be updated
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -179,7 +191,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         );
 
-    // File layer: DEBUG level, full format with timestamps
+    // File layer: DEBUG for our crate, WARN for noisy dependencies
     let file_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)
@@ -187,7 +199,9 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .with_writer(file_writer)
         .with_ansi(false)
-        .with_filter(tracing_subscriber::EnvFilter::new("debug"));
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            "info,walmart_dashboard=debug,html5ever=warn,markup5ever=warn,selectors=warn"
+        ));
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -354,13 +368,14 @@ async fn main() -> Result<()> {
             web::serve(db, port).await?;
         }
 
-        Commands::DebugEmail { id } => {
+        Commands::DebugEmail { id, event_type: filter_type } => {
             let db = Database::from_file(&db_path).await?;
             db.run_migrations().await?;
 
-            let query = match id {
-                Some(id) => format!("SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails WHERE id = {}", id),
-                None => "SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails LIMIT 1".to_string(),
+            let query = match (id, filter_type) {
+                (Some(id), _) => format!("SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails WHERE id = {}", id),
+                (None, Some(etype)) => format!("SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails WHERE event_type = '{}' LIMIT 1", etype),
+                (None, None) => "SELECT id, gmail_id, subject, raw_body, event_type FROM raw_emails LIMIT 1".to_string(),
             };
 
             let row: Option<(i64, String, Option<String>, String, String)> =
@@ -384,10 +399,12 @@ async fn main() -> Result<()> {
                 let parser = walmart_dashboard::parsing::WalmartEmailParser::new();
                 let order_id = parser.extract_order_id(&raw_body);
                 let total = parser.extract_total_price(&raw_body);
+                let order_date = parser.extract_order_date(&raw_body);
 
                 println!("\n--- Parser results ---");
                 println!("  Order ID: {:?}", order_id);
                 println!("  Total: {:?}", total);
+                println!("  Order Date: {:?}", order_date);
 
                 // If order exists, show current DB value
                 if let Ok(oid) = &order_id {
@@ -845,6 +862,87 @@ async fn main() -> Result<()> {
                 None => {
                     println!("Account {} not found.", email);
                 }
+            }
+        }
+
+        Commands::FixDates { dry_run } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            let parser = walmart_dashboard::parsing::WalmartEmailParser::new();
+
+            // Get all raw emails and extract order_id and date from each
+            // Prefer confirmation emails as they have the most reliable date
+            let emails: Vec<(i64, String, String)> = sqlx::query_as(
+                r#"
+                SELECT id, raw_body, event_type
+                FROM raw_emails
+                WHERE processing_status = 'processed'
+                ORDER BY
+                    CASE event_type
+                        WHEN 'confirmation' THEN 1
+                        WHEN 'shipping' THEN 2
+                        WHEN 'delivery' THEN 3
+                        ELSE 4
+                    END,
+                    id
+                "#
+            )
+            .fetch_all(db.pool())
+            .await?;
+
+            let mut updated = 0;
+            let mut failed = 0;
+            let mut order_dates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+            // First pass: collect dates from all emails
+            for (_id, raw_body, _event_type) in &emails {
+                if let Ok(order_id) = parser.extract_order_id(raw_body) {
+                    // Only use first date found (confirmation emails are first due to ORDER BY)
+                    if !order_dates.contains_key(&order_id) {
+                        if let Ok(date) = parser.extract_order_date(raw_body) {
+                            let date_str = date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                            order_dates.insert(order_id, date_str);
+                        }
+                    }
+                }
+            }
+
+            println!("Found dates for {} orders", order_dates.len());
+
+            // Second pass: update orders
+            for (order_id, date_str) in &order_dates {
+                // Check current date
+                let current: Option<(Option<String>,)> = sqlx::query_as(
+                    "SELECT order_date FROM orders WHERE id = ?"
+                )
+                .bind(order_id)
+                .fetch_optional(db.pool())
+                .await?;
+
+                if let Some((current_date,)) = current {
+                    if dry_run {
+                        println!("[DRY RUN] {} : {:?} -> {}", order_id, current_date, date_str);
+                    } else {
+                        sqlx::query("UPDATE orders SET order_date = ? WHERE id = ?")
+                            .bind(date_str)
+                            .bind(order_id)
+                            .execute(db.pool())
+                            .await?;
+                    }
+                    updated += 1;
+                } else {
+                    failed += 1; // Order not found in DB
+                }
+            }
+
+            if dry_run {
+                println!("\n[DRY RUN] Would update {} orders", updated);
+            } else {
+                println!("Updated {} order dates", updated);
+            }
+            if failed > 0 {
+                println!("Could not find {} orders in database", failed);
             }
         }
     }

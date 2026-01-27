@@ -10,6 +10,7 @@ let allAccounts = [];
 let currentFilter = 'all';
 let currentSort = 'date'; // 'date' or 'status'
 let currentAccountId = null; // null = all accounts
+let currentDatePreset = '0'; // '7', '30', '90', or '0' (all)
 
 // Status priority for sorting (lower = higher priority)
 const statusPriority = {
@@ -51,11 +52,37 @@ const trackingStateColors = {
 const trackingCache = new Map();
 
 /**
+ * Get date range params from current preset
+ * @returns {{startDate: string|null, endDate: string|null}}
+ */
+function getDateRangeParams() {
+    if (currentDatePreset === '0') {
+        return { startDate: null, endDate: null };
+    }
+    const days = parseInt(currentDatePreset);
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - days);
+    return {
+        startDate: start.toISOString().split('T')[0],
+        endDate: end.toISOString().split('T')[0],
+    };
+}
+
+/**
  * Load dashboard data from the Rust backend
  */
 async function loadDashboard() {
     try {
-        const data = await invoke('get_dashboard', { accountId: currentAccountId });
+        const { startDate, endDate } = getDateRangeParams();
+        // Build args object - only include non-null values
+        // Tauri v2 uses camelCase for parameter names
+        const args = {};
+        if (currentAccountId !== null) args.accountId = currentAccountId;
+        if (startDate !== null) args.startDate = startDate;
+        if (endDate !== null) args.endDate = endDate;
+        console.log('Invoking get_dashboard with args:', args);
+        const data = await invoke('get_dashboard', args);
         allOrders = data.orders || [];
         allAccounts = data.accounts || [];
         renderSidebar(data);
@@ -112,10 +139,10 @@ function renderStats(orders) {
         ? totalSpent / ordersWithTotal.length
         : 0;
 
-    // Count orders this week
+    // Count orders this week (excluding canceled)
     const oneWeekAgo = new Date();
     oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-    const thisWeek = orders.filter(o => new Date(o.order_date) >= oneWeekAgo).length;
+    const thisWeek = activeOrders.filter(o => new Date(o.order_date) >= oneWeekAgo).length;
 
     // Update UI
     document.getElementById('stat-total-spent').textContent = '$' + totalSpent.toFixed(2);
@@ -601,6 +628,23 @@ function setupFilterListeners() {
 }
 
 /**
+ * Handle date preset button clicks
+ */
+function setupDatePresetListeners() {
+    document.querySelectorAll('.date-preset').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            // Update active state
+            document.querySelectorAll('.date-preset').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+
+            // Update preset and reload data
+            currentDatePreset = btn.dataset.days;
+            await loadDashboard();
+        });
+    });
+}
+
+/**
  * Escape HTML to prevent XSS
  */
 function escapeHtml(text) {
@@ -613,6 +657,7 @@ function escapeHtml(text) {
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     setupFilterListeners();
+    setupDatePresetListeners();
     loadDashboard();
 
     // Listen for tracking sync complete event from backend

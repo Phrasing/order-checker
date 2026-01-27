@@ -142,16 +142,27 @@ pub async fn get_dashboard_data_filtered(
     db: &Database,
     account_id: Option<i64>,
 ) -> Result<DashboardData> {
+    get_dashboard_data_with_dates(db, account_id, None, None).await
+}
+
+/// Get dashboard data filtered by account and date range
+/// start_date and end_date should be in ISO format "YYYY-MM-DD"
+pub async fn get_dashboard_data_with_dates(
+    db: &Database,
+    account_id: Option<i64>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<DashboardData> {
     // Fetch accounts list
     let accounts = fetch_account_view_models(db).await?;
 
-    // Fetch orders with their items (optionally filtered by account)
-    let orders = fetch_orders_with_items_filtered(db, account_id).await?;
+    // Fetch orders with their items (optionally filtered by account and date)
+    let orders = fetch_orders_with_items_and_dates(db, account_id, start_date, end_date).await?;
 
-    // Get counts (optionally filtered by account)
+    // Get counts (optionally filtered by account and date)
     let total_orders = orders.len() as i64;
     let pending_emails = fetch_pending_email_count_filtered(db, account_id).await?;
-    let status_counts = fetch_status_counts_filtered(db, account_id).await?;
+    let status_counts = fetch_status_counts_with_dates(db, account_id, start_date, end_date).await?;
 
     let last_updated = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
@@ -288,34 +299,136 @@ pub async fn fetch_orders_with_items_filtered(
     db: &Database,
     account_id: Option<i64>,
 ) -> Result<Vec<OrderViewModel>> {
-    // Build query based on whether we're filtering by account
-    let order_rows: Vec<(String, String, Option<f64>, String, Option<String>, Option<String>)> = match account_id {
-        Some(acc_id) => {
-            sqlx::query_as(
-                r#"
-                SELECT id, order_date, total_cost, status, tracking_number, carrier
-                FROM orders
-                WHERE account_id = ?
-                ORDER BY order_date DESC
-                "#
-            )
-            .bind(acc_id)
-            .fetch_all(db.pool())
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                r#"
-                SELECT id, order_date, total_cost, status, tracking_number, carrier
-                FROM orders
-                ORDER BY order_date DESC
-                "#
-            )
-            .fetch_all(db.pool())
-            .await?
-        }
-    };
+    fetch_orders_with_items_and_dates(db, account_id, None, None).await
+}
 
+/// Fetch orders filtered by account and date range
+/// start_date and end_date should be in ISO format "YYYY-MM-DD"
+pub async fn fetch_orders_with_items_and_dates(
+    db: &Database,
+    account_id: Option<i64>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<Vec<OrderViewModel>> {
+    tracing::debug!(
+        "fetch_orders_with_items_and_dates: account_id={:?}, start_date={:?}, end_date={:?}",
+        account_id, start_date, end_date
+    );
+    // Build query based on filters
+    let order_rows: Vec<(String, String, Option<f64>, String, Option<String>, Option<String>)> =
+        match (account_id, start_date, end_date) {
+            (Some(acc_id), Some(start), Some(end)) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE account_id = ? AND substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(acc_id)
+                .bind(start)
+                .bind(end)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (Some(acc_id), Some(start), None) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE account_id = ? AND substr(order_date, 1, 10) >= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(acc_id)
+                .bind(start)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (Some(acc_id), None, Some(end)) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE account_id = ? AND substr(order_date, 1, 10) <= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(acc_id)
+                .bind(end)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (Some(acc_id), None, None) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE account_id = ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(acc_id)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (None, Some(start), Some(end)) => {
+                tracing::debug!("Using date-filtered query: {} to {}", start, end);
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(start)
+                .bind(end)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (None, Some(start), None) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE substr(order_date, 1, 10) >= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(start)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (None, None, Some(end)) => {
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    WHERE substr(order_date, 1, 10) <= ?
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .bind(end)
+                .fetch_all(db.pool())
+                .await?
+            }
+            (None, None, None) => {
+                tracing::debug!("Using unfiltered query (no date range)");
+                sqlx::query_as(
+                    r#"
+                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    FROM orders
+                    ORDER BY order_date DESC
+                    "#
+                )
+                .fetch_all(db.pool())
+                .await?
+            }
+        };
+
+    tracing::debug!("Query returned {} orders", order_rows.len());
     let mut orders = Vec::new();
 
     for (id, order_date, total_cost, status, tracking_number, carrier) in order_rows {
@@ -390,10 +503,49 @@ pub async fn fetch_status_counts_filtered(
     db: &Database,
     account_id: Option<i64>,
 ) -> Result<StatusCounts> {
+    fetch_status_counts_with_dates(db, account_id, None, None).await
+}
+
+/// Fetch status counts filtered by account and date range
+pub async fn fetch_status_counts_with_dates(
+    db: &Database,
+    account_id: Option<i64>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<StatusCounts> {
     let mut counts = StatusCounts::default();
 
-    let rows: Vec<(String, i64)> = match account_id {
-        Some(acc_id) => {
+    // Build dynamic query based on filters
+    let rows: Vec<(String, i64)> = match (account_id, start_date, end_date) {
+        (Some(acc_id), Some(start), Some(end)) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE account_id = ? AND substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ? GROUP BY status"
+            )
+            .bind(acc_id)
+            .bind(start)
+            .bind(end)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (Some(acc_id), Some(start), None) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE account_id = ? AND substr(order_date, 1, 10) >= ? GROUP BY status"
+            )
+            .bind(acc_id)
+            .bind(start)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (Some(acc_id), None, Some(end)) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE account_id = ? AND substr(order_date, 1, 10) <= ? GROUP BY status"
+            )
+            .bind(acc_id)
+            .bind(end)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (Some(acc_id), None, None) => {
             sqlx::query_as(
                 "SELECT status, COUNT(*) FROM orders WHERE account_id = ? GROUP BY status"
             )
@@ -401,7 +553,32 @@ pub async fn fetch_status_counts_filtered(
             .fetch_all(db.pool())
             .await?
         }
-        None => {
+        (None, Some(start), Some(end)) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ? GROUP BY status"
+            )
+            .bind(start)
+            .bind(end)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (None, Some(start), None) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE substr(order_date, 1, 10) >= ? GROUP BY status"
+            )
+            .bind(start)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (None, None, Some(end)) => {
+            sqlx::query_as(
+                "SELECT status, COUNT(*) FROM orders WHERE substr(order_date, 1, 10) <= ? GROUP BY status"
+            )
+            .bind(end)
+            .fetch_all(db.pool())
+            .await?
+        }
+        (None, None, None) => {
             sqlx::query_as(
                 "SELECT status, COUNT(*) FROM orders GROUP BY status"
             )

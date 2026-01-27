@@ -36,6 +36,9 @@ NUL
 debug_output.txt
 price_debug*.txt
 
+# Logs (can grow very large)
+logs/
+
 # Claude Code
 .cdp-tools/
 .claude/

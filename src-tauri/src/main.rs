@@ -172,6 +172,7 @@ fn main() {
             commands::fetch_tracking,
             commands::list_accounts,
             commands::restart_tracking_session,
+            commands::process_emails,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")

@@ -605,6 +605,37 @@
         .account-section .filter-label {
             margin-bottom: 8px;
         }
+
+        /* Date range presets */
+        .date-presets {
+            display: flex;
+            gap: 6px;
+            padding: 0 8px;
+        }
+
+        .date-preset {
+            flex: 1;
+            padding: 6px 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-secondary);
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .date-preset:hover {
+            background: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .date-preset.active {
+            background: var(--accent-blue);
+            color: white;
+            border-color: var(--accent-blue);
+        }
     </style>
 </head>
 <body>
@@ -644,6 +675,17 @@
                         Canceled
                         <span class="filter-count" id="count-canceled">--</span>
                     </div>
+                </div>
+            </div>
+
+            <!-- Date Range Filter -->
+            <div class="filter-section" id="date-range-section">
+                <div class="filter-label">Date Range</div>
+                <div class="date-presets">
+                    <button class="date-preset" data-days="7">7d</button>
+                    <button class="date-preset" data-days="30">30d</button>
+                    <button class="date-preset" data-days="90">90d</button>
+                    <button class="date-preset active" data-days="0">All</button>
                 </div>
             </div>
 
