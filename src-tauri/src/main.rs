@@ -7,7 +7,6 @@ use commands::AppState;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use tracing_appender::rolling;
 use walmart_dashboard::db::Database;
@@ -89,6 +88,20 @@ fn main() {
 
             tracing::info!("Using database: {}", db_path.display());
 
+            // Find client_secret.json for OAuth
+            let client_secret_paths = [
+                PathBuf::from("client_secret.json"),
+                PathBuf::from("../client_secret.json"),
+            ];
+
+            let client_secret_path = client_secret_paths
+                .iter()
+                .find(|p| p.exists())
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("client_secret.json"));
+
+            tracing::info!("Using client_secret: {}", client_secret_path.display());
+
             // Use tokio runtime for async initialization
             let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
@@ -108,8 +121,8 @@ fn main() {
                 })
                 .expect("Failed to initialize database");
 
-            // Wrap db and create tracking service
-            let db = Arc::new(Mutex::new(db));
+            // Wrap db in Arc (SqlitePool is already Send+Sync, no Mutex needed)
+            let db = Arc::new(db);
             let tracking_service = TrackingService::new();
 
             // Clone for background task before moving into AppState
@@ -120,6 +133,7 @@ fn main() {
             app.manage(AppState {
                 db,
                 db_path,
+                client_secret_path,
                 tracking_service,
             });
 
@@ -130,11 +144,11 @@ fn main() {
 
                 tracing::info!("Starting background tracking fetch...");
 
-                let db = db_for_task.lock().await;
+                let db = &*db_for_task;
 
                 // Batch fetch orders missing cached tracking data
                 if let Err(e) =
-                    walmart_dashboard::tracking::fetch_missing_tracking_batch(&db, &tracking_service_for_task)
+                    walmart_dashboard::tracking::fetch_missing_tracking_batch(db, &tracking_service_for_task)
                         .await
                 {
                     tracing::error!("Failed to fetch missing tracking: {}", e);
@@ -142,14 +156,14 @@ fn main() {
 
                 // Batch refresh stale entries (>4 hours old, not delivered)
                 if let Err(e) =
-                    walmart_dashboard::tracking::refresh_stale_tracking_batch(&db, &tracking_service_for_task, 4)
+                    walmart_dashboard::tracking::refresh_stale_tracking_batch(db, &tracking_service_for_task, 4)
                         .await
                 {
                     tracing::error!("Failed to refresh stale tracking: {}", e);
                 }
 
                 // Sync order status from tracking data (shipped -> delivered)
-                if let Err(e) = walmart_dashboard::tracking::sync_delivered_from_tracking(&db).await
+                if let Err(e) = walmart_dashboard::tracking::sync_delivered_from_tracking(db).await
                 {
                     tracing::error!("Failed to sync delivered orders: {}", e);
                 }
@@ -173,6 +187,7 @@ fn main() {
             commands::list_accounts,
             commands::restart_tracking_session,
             commands::process_emails,
+            commands::sync_and_process_orders,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")

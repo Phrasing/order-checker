@@ -43,8 +43,8 @@ impl Database {
 
     /// Run migrations to set up the database schema
     pub async fn run_migrations(&self) -> Result<()> {
-        // Run all migrations in order
-        let migrations = [
+        // Phase 1: Core schema migrations (tables and structure)
+        let schema_migrations = [
             include_str!("../../migrations/001_initial_schema.sql"),
             include_str!("../../migrations/002_raw_emails.sql"),
             include_str!("../../migrations/003_tracking_info.sql"),
@@ -53,25 +53,28 @@ impl Database {
             include_str!("../../migrations/006_fix_line_items_duplicates.sql"),
         ];
 
-        for (i, migration_sql) in migrations.iter().enumerate() {
+        for (i, migration_sql) in schema_migrations.iter().enumerate() {
             sqlx::raw_sql(migration_sql)
                 .execute(&self.pool)
                 .await?;
             tracing::debug!("Migration {} completed", i + 1);
         }
 
-        // Handle columns that may already exist - SQLite doesn't support IF NOT EXISTS for ALTER TABLE
+        // Phase 2: Add columns that may already exist
+        // Must run before data migrations (007+) that reference these columns
+        // SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN
         let optional_columns = [
             "ALTER TABLE orders ADD COLUMN tracking_number TEXT",
             "ALTER TABLE orders ADD COLUMN carrier TEXT",
             "ALTER TABLE orders ADD COLUMN account_id INTEGER REFERENCES accounts(id)",
             "ALTER TABLE raw_emails ADD COLUMN account_id INTEGER REFERENCES accounts(id)",
+            "ALTER TABLE orders ADD COLUMN shipped_date TEXT",
+            "ALTER TABLE accounts ADD COLUMN profile_picture_url TEXT",
         ];
         for sql in optional_columns {
             match sqlx::query(sql).execute(&self.pool).await {
                 Ok(_) => tracing::debug!("Added column successfully"),
                 Err(e) => {
-                    // Ignore "duplicate column name" errors (SQLite error code 1)
                     if !e.to_string().contains("duplicate column name") {
                         return Err(e.into());
                     }
@@ -79,6 +82,27 @@ impl Database {
                 }
             }
         }
+
+        // Phase 3: Data migrations that depend on optional columns
+        let data_migrations = [
+            ("007", include_str!("../../migrations/007_shipped_date.sql")),
+            ("008", include_str!("../../migrations/008_fix_shipped_date.sql")),
+            ("009", include_str!("../../migrations/009_profile_picture.sql")),
+            ("011", include_str!("../../migrations/011_clear_processed_bodies.sql")),
+        ];
+
+        for (name, migration_sql) in data_migrations {
+            sqlx::raw_sql(migration_sql)
+                .execute(&self.pool)
+                .await?;
+            tracing::debug!("Migration {} completed", name);
+        }
+
+        // Phase 4: Indexes that depend on optional columns
+        sqlx::raw_sql(include_str!("../../migrations/010_indexes.sql"))
+            .execute(&self.pool)
+            .await?;
+        tracing::debug!("Migration 010 (indexes) completed");
 
         tracing::info!("All database migrations completed successfully");
         Ok(())
@@ -255,10 +279,10 @@ impl Database {
 
     /// Get account by email address
     pub async fn get_account_by_email(&self, email: &str) -> Result<Option<Account>> {
-        let row: Option<(i64, String, Option<String>, String, i32, Option<String>, String, String)> =
+        let row: Option<(i64, String, Option<String>, Option<String>, String, i32, Option<String>, String, String)> =
             sqlx::query_as(
                 r#"
-                SELECT id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at
+                SELECT id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at
                 FROM accounts
                 WHERE email = ?
                 "#,
@@ -268,11 +292,12 @@ impl Database {
             .await?;
 
         Ok(row.map(
-            |(id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
+            |(id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
                 Account {
                     id,
                     email,
                     display_name,
+                    profile_picture_url,
                     token_cache_path,
                     is_active: is_active != 0,
                     last_sync_at,
@@ -285,10 +310,10 @@ impl Database {
 
     /// Get account by ID
     pub async fn get_account_by_id(&self, id: i64) -> Result<Option<Account>> {
-        let row: Option<(i64, String, Option<String>, String, i32, Option<String>, String, String)> =
+        let row: Option<(i64, String, Option<String>, Option<String>, String, i32, Option<String>, String, String)> =
             sqlx::query_as(
                 r#"
-                SELECT id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at
+                SELECT id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at
                 FROM accounts
                 WHERE id = ?
                 "#,
@@ -298,11 +323,12 @@ impl Database {
             .await?;
 
         Ok(row.map(
-            |(id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
+            |(id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
                 Account {
                     id,
                     email,
                     display_name,
+                    profile_picture_url,
                     token_cache_path,
                     is_active: is_active != 0,
                     last_sync_at,
@@ -315,10 +341,10 @@ impl Database {
 
     /// List all active accounts
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
-        let rows: Vec<(i64, String, Option<String>, String, i32, Option<String>, String, String)> =
+        let rows: Vec<(i64, String, Option<String>, Option<String>, String, i32, Option<String>, String, String)> =
             sqlx::query_as(
                 r#"
-                SELECT id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at
+                SELECT id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at
                 FROM accounts
                 WHERE is_active = 1
                 ORDER BY email
@@ -330,11 +356,12 @@ impl Database {
         Ok(rows
             .into_iter()
             .map(
-                |(id, email, display_name, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
+                |(id, email, display_name, profile_picture_url, token_cache_path, is_active, last_sync_at, created_at, updated_at)| {
                     Account {
                         id,
                         email,
                         display_name,
+                        profile_picture_url,
                         token_cache_path,
                         is_active: is_active != 0,
                         last_sync_at,
@@ -363,6 +390,16 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        Ok(())
+    }
+
+    /// Update account profile picture URL
+    pub async fn update_account_profile_picture(&self, account_id: i64, url: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE accounts SET profile_picture_url = ? WHERE id = ?")
+            .bind(url)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -497,6 +534,7 @@ pub struct Account {
     pub id: i64,
     pub email: String,
     pub display_name: Option<String>,
+    pub profile_picture_url: Option<String>,
     pub token_cache_path: String,
     pub is_active: bool,
     pub last_sync_at: Option<String>,

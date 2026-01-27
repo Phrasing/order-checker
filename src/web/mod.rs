@@ -13,6 +13,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -26,6 +27,7 @@ pub struct AppState {
 pub struct OrderViewModel {
     pub id: String,
     pub order_date: String,
+    pub shipped_date: Option<String>,
     pub status: String,
     pub total_cost: Option<String>,
     pub items: Vec<ItemViewModel>,
@@ -57,6 +59,7 @@ pub struct AccountViewModel {
     pub id: i64,
     pub email: String,
     pub display_name: Option<String>,
+    pub profile_picture_url: Option<String>,
     pub order_count: i64,
     pub last_sync_at: Option<String>,
 }
@@ -177,52 +180,55 @@ pub async fn get_dashboard_data_with_dates(
     })
 }
 
-/// Fetch all orders with their line items
-pub async fn fetch_orders_with_items(db: &Database) -> Result<Vec<OrderViewModel>> {
-    // Fetch orders
-    let order_rows: Vec<(String, String, Option<f64>, String, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id, order_date, total_cost, status, tracking_number, carrier
-        FROM orders
-        ORDER BY order_date DESC
-        "#
-    )
-    .fetch_all(db.pool())
-    .await?;
+/// Batch-fetch all line items for a set of order IDs, grouped by order_id.
+/// Uses a single query instead of N individual queries.
+async fn fetch_items_for_orders(db: &Database, order_ids: &[&str]) -> Result<HashMap<String, Vec<ItemViewModel>>> {
+    if order_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
 
-    let mut orders = Vec::new();
+    // Build a single query with IN clause
+    let placeholders: String = order_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT order_id, name, quantity, status FROM line_items WHERE order_id IN ({})",
+        placeholders
+    );
 
-    for (id, order_date, total_cost, status, tracking_number, carrier) in order_rows {
-        // Fetch items for this order
-        let item_rows: Vec<(String, i32, String)> = sqlx::query_as(
-            r#"
-            SELECT name, quantity, status
-            FROM line_items
-            WHERE order_id = ?
-            "#
-        )
-        .bind(&id)
-        .fetch_all(db.pool())
-        .await?;
+    let mut q = sqlx::query_as::<_, (String, String, i32, String)>(&query);
+    for id in order_ids {
+        q = q.bind(*id);
+    }
 
-        let items: Vec<ItemViewModel> = item_rows
-            .into_iter()
-            .map(|(name, quantity, status)| ItemViewModel {
-                name,
-                quantity: quantity as u32,
-                status,
-            })
-            .collect();
+    let item_rows = q.fetch_all(db.pool()).await?;
 
-        // Format the date for display
+    let mut items_by_order: HashMap<String, Vec<ItemViewModel>> = HashMap::with_capacity(order_ids.len());
+    for (order_id, name, quantity, status) in item_rows {
+        items_by_order.entry(order_id).or_default().push(ItemViewModel {
+            name,
+            quantity: quantity as u32,
+            status,
+        });
+    }
+
+    Ok(items_by_order)
+}
+
+/// Build OrderViewModels from raw order rows + pre-fetched items map
+fn build_order_view_models(
+    order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)>,
+    mut items_by_order: HashMap<String, Vec<ItemViewModel>>,
+) -> Vec<OrderViewModel> {
+    let mut orders = Vec::with_capacity(order_rows.len());
+
+    for (id, order_date, shipped_date, total_cost, status, tracking_number, carrier) in order_rows {
+        let items = items_by_order.remove(&id).unwrap_or_default();
         let formatted_date = format_date(&order_date);
-
-        // Format total cost
         let formatted_total = total_cost.map(|t| format!("{:.2}", t));
 
         orders.push(OrderViewModel {
             id,
             order_date: formatted_date,
+            shipped_date: shipped_date.as_deref().map(format_date),
             status,
             total_cost: formatted_total,
             items,
@@ -231,7 +237,25 @@ pub async fn fetch_orders_with_items(db: &Database) -> Result<Vec<OrderViewModel
         });
     }
 
-    Ok(orders)
+    orders
+}
+
+/// Fetch all orders with their line items (2 queries instead of N+1)
+pub async fn fetch_orders_with_items(db: &Database) -> Result<Vec<OrderViewModel>> {
+    let order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
+        FROM orders
+        ORDER BY order_date DESC
+        "#
+    )
+    .fetch_all(db.pool())
+    .await?;
+
+    let order_ids: Vec<&str> = order_rows.iter().map(|(id, ..)| id.as_str()).collect();
+    let items_by_order = fetch_items_for_orders(db, &order_ids).await?;
+
+    Ok(build_order_view_models(order_rows, items_by_order))
 }
 
 /// Format ISO date to a readable format
@@ -258,40 +282,35 @@ pub async fn fetch_status_counts(db: &Database) -> Result<StatusCounts> {
 
 // ==================== Account-Filtered Functions ====================
 
-/// Fetch account view models with order counts
+/// Fetch account view models with order counts (single query with LEFT JOIN)
 pub async fn fetch_account_view_models(db: &Database) -> Result<Vec<AccountViewModel>> {
-    let rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+    let rows: Vec<(i64, String, Option<String>, Option<String>, Option<String>, i64)> = sqlx::query_as(
         r#"
-        SELECT id, email, display_name, last_sync_at
-        FROM accounts
-        WHERE is_active = 1
-        ORDER BY email
+        SELECT a.id, a.email, a.display_name, a.profile_picture_url, a.last_sync_at,
+               COUNT(o.id) as order_count
+        FROM accounts a
+        LEFT JOIN orders o ON a.id = o.account_id
+        WHERE a.is_active = 1
+        GROUP BY a.id
+        ORDER BY a.email
         "#
     )
     .fetch_all(db.pool())
     .await?;
 
-    let mut accounts = Vec::new();
-
-    for (id, email, display_name, last_sync_at) in rows {
-        // Get order count for this account
-        let (order_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM orders WHERE account_id = ?"
-        )
-        .bind(id)
-        .fetch_one(db.pool())
-        .await?;
-
-        accounts.push(AccountViewModel {
-            id,
-            email,
-            display_name,
-            order_count,
-            last_sync_at,
-        });
-    }
-
-    Ok(accounts)
+    Ok(rows
+        .into_iter()
+        .map(|(id, email, display_name, profile_picture_url, last_sync_at, order_count)| {
+            AccountViewModel {
+                id,
+                email,
+                display_name,
+                profile_picture_url,
+                order_count,
+                last_sync_at,
+            }
+        })
+        .collect())
 }
 
 /// Fetch orders filtered by account
@@ -315,12 +334,12 @@ pub async fn fetch_orders_with_items_and_dates(
         account_id, start_date, end_date
     );
     // Build query based on filters
-    let order_rows: Vec<(String, String, Option<f64>, String, Option<String>, Option<String>)> =
+    let order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)> =
         match (account_id, start_date, end_date) {
             (Some(acc_id), Some(start), Some(end)) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE account_id = ? AND substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ?
                     ORDER BY order_date DESC
@@ -335,7 +354,7 @@ pub async fn fetch_orders_with_items_and_dates(
             (Some(acc_id), Some(start), None) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE account_id = ? AND substr(order_date, 1, 10) >= ?
                     ORDER BY order_date DESC
@@ -349,7 +368,7 @@ pub async fn fetch_orders_with_items_and_dates(
             (Some(acc_id), None, Some(end)) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE account_id = ? AND substr(order_date, 1, 10) <= ?
                     ORDER BY order_date DESC
@@ -363,7 +382,7 @@ pub async fn fetch_orders_with_items_and_dates(
             (Some(acc_id), None, None) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE account_id = ?
                     ORDER BY order_date DESC
@@ -377,7 +396,7 @@ pub async fn fetch_orders_with_items_and_dates(
                 tracing::debug!("Using date-filtered query: {} to {}", start, end);
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE substr(order_date, 1, 10) >= ? AND substr(order_date, 1, 10) <= ?
                     ORDER BY order_date DESC
@@ -391,7 +410,7 @@ pub async fn fetch_orders_with_items_and_dates(
             (None, Some(start), None) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE substr(order_date, 1, 10) >= ?
                     ORDER BY order_date DESC
@@ -404,7 +423,7 @@ pub async fn fetch_orders_with_items_and_dates(
             (None, None, Some(end)) => {
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     WHERE substr(order_date, 1, 10) <= ?
                     ORDER BY order_date DESC
@@ -418,7 +437,7 @@ pub async fn fetch_orders_with_items_and_dates(
                 tracing::debug!("Using unfiltered query (no date range)");
                 sqlx::query_as(
                     r#"
-                    SELECT id, order_date, total_cost, status, tracking_number, carrier
+                    SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
                     FROM orders
                     ORDER BY order_date DESC
                     "#
@@ -429,48 +448,11 @@ pub async fn fetch_orders_with_items_and_dates(
         };
 
     tracing::debug!("Query returned {} orders", order_rows.len());
-    let mut orders = Vec::new();
 
-    for (id, order_date, total_cost, status, tracking_number, carrier) in order_rows {
-        // Fetch items for this order
-        let item_rows: Vec<(String, i32, String)> = sqlx::query_as(
-            r#"
-            SELECT name, quantity, status
-            FROM line_items
-            WHERE order_id = ?
-            "#
-        )
-        .bind(&id)
-        .fetch_all(db.pool())
-        .await?;
+    let order_ids: Vec<&str> = order_rows.iter().map(|(id, ..)| id.as_str()).collect();
+    let items_by_order = fetch_items_for_orders(db, &order_ids).await?;
 
-        let items: Vec<ItemViewModel> = item_rows
-            .into_iter()
-            .map(|(name, quantity, status)| ItemViewModel {
-                name,
-                quantity: quantity as u32,
-                status,
-            })
-            .collect();
-
-        // Format the date for display
-        let formatted_date = format_date(&order_date);
-
-        // Format total cost
-        let formatted_total = total_cost.map(|t| format!("{:.2}", t));
-
-        orders.push(OrderViewModel {
-            id,
-            order_date: formatted_date,
-            status,
-            total_cost: formatted_total,
-            items,
-            tracking_number,
-            carrier,
-        });
-    }
-
-    Ok(orders)
+    Ok(build_order_view_models(order_rows, items_by_order))
 }
 
 /// Fetch pending email count filtered by account

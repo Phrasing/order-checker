@@ -29,11 +29,12 @@ CREATE TABLE IF NOT EXISTS accounts (
 -- via ALTER TABLE in db/mod.rs (with duplicate column handling)
 -- SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN
 
--- Indexes for efficient queries
+-- Indexes for the accounts table itself
 CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
 CREATE INDEX IF NOT EXISTS idx_accounts_active ON accounts(is_active);
-CREATE INDEX IF NOT EXISTS idx_raw_emails_account ON raw_emails(account_id);
-CREATE INDEX IF NOT EXISTS idx_orders_account ON orders(account_id);
+
+-- Note: indexes on orders(account_id) and raw_emails(account_id) are created
+-- in migration 010 which runs after optional_columns adds the account_id columns
 
 -- Trigger to update the updated_at timestamp on accounts
 CREATE TRIGGER IF NOT EXISTS accounts_updated_at

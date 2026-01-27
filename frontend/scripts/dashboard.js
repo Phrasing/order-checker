@@ -11,6 +11,8 @@ let currentFilter = 'all';
 let currentSort = 'date'; // 'date' or 'status'
 let currentAccountId = null; // null = all accounts
 let currentDatePreset = '0'; // '7', '30', '90', or '0' (all)
+let currentSearchQuery = '';
+let isSyncing = false;
 
 // Status priority for sorting (lower = higher priority)
 const statusPriority = {
@@ -20,6 +22,14 @@ const statusPriority = {
     'delivered': 4,
     'canceled': 5
 };
+
+// Display shipped_date for shipped/delivered orders, order_date otherwise
+function displayDate(order) {
+    if ((order.status === 'shipped' || order.status === 'delivered') && order.shipped_date) {
+        return order.shipped_date;
+    }
+    return order.order_date;
+}
 
 // Carrier tracking URL generators
 const trackingUrls = {
@@ -88,7 +98,7 @@ async function loadDashboard() {
         renderSidebar(data);
         renderAccountSelector(allAccounts);
         renderStats(allOrders);
-        renderOrders(filterOrders(allOrders, currentFilter));
+        applyFiltersAndRender();
         updateHeader();
     } catch (error) {
         console.error('Failed to load dashboard:', error);
@@ -156,22 +166,44 @@ function renderStats(orders) {
  * Only shows the section if there are multiple accounts
  */
 function renderAccountSelector(accounts) {
-    const section = document.getElementById('account-section');
     const select = document.getElementById('account-select');
+    const avatar = document.getElementById('account-avatar');
+    const avatarFallback = document.getElementById('account-avatar-fallback');
 
-    // Only show if there are accounts configured
-    if (accounts.length === 0) {
-        section.style.display = 'none';
+    // Determine the account to show in the avatar
+    const selectedAccount = currentAccountId
+        ? accounts.find(a => a.id === currentAccountId)
+        : accounts[0];
+
+    // Update avatar display
+    if (selectedAccount && selectedAccount.profile_picture_url) {
+        avatar.src = selectedAccount.profile_picture_url;
+        avatar.alt = selectedAccount.email;
+        avatar.title = selectedAccount.email;
+        avatar.style.display = 'block';
+        avatarFallback.style.display = 'none';
+    } else if (selectedAccount) {
+        avatarFallback.textContent = selectedAccount.email.charAt(0).toUpperCase();
+        avatarFallback.title = selectedAccount.email;
+        avatarFallback.style.display = 'flex';
+        avatar.style.display = 'none';
+    } else {
+        avatar.style.display = 'none';
+        avatarFallback.style.display = 'none';
+    }
+
+    // Only show the select dropdown if there are multiple accounts
+    if (accounts.length <= 1) {
+        select.style.display = 'none';
         return;
     }
 
-    section.style.display = 'block';
+    select.style.display = 'block';
 
     // Build options HTML
     const optionsHtml = `
         <option value="">All Accounts (${accounts.reduce((sum, a) => sum + a.order_count, 0)})</option>
         ${accounts.map(acc => {
-            const displayName = acc.display_name || acc.email;
             const shortEmail = acc.email.split('@')[0];
             return `<option value="${acc.id}" ${acc.id === currentAccountId ? 'selected' : ''}>
                 ${escapeHtml(shortEmail)} (${acc.order_count})
@@ -191,11 +223,62 @@ window.handleAccountChange = async function(value) {
 };
 
 /**
+ * Sync orders from Gmail and process them
+ */
+window.syncOrders = async function() {
+    if (isSyncing) return;
+
+    isSyncing = true;
+    const btn = document.getElementById('sync-btn');
+    btn.classList.add('loading');
+    btn.disabled = true;
+
+    try {
+        console.log('Starting sync...');
+        const result = await invoke('sync_and_process_orders');
+        console.log('Sync complete:', result);
+
+        // Show result message
+        if (result.success) {
+            updateLastUpdated(`Synced ${result.emails_synced} emails, processed ${result.orders_processed} orders`);
+        } else {
+            console.warn('Sync had errors:', result.errors);
+            updateLastUpdated('Sync completed with errors');
+        }
+
+        // Refresh dashboard
+        await loadDashboard();
+    } catch (error) {
+        console.error('Sync failed:', error);
+        updateLastUpdated(`Sync failed: ${error}`);
+    } finally {
+        isSyncing = false;
+        btn.classList.remove('loading');
+        btn.disabled = false;
+    }
+};
+
+/**
  * Filter orders by status
  */
 function filterOrders(orders, filter) {
     if (filter === 'all') return orders;
     return orders.filter(o => o.status === filter);
+}
+
+function searchOrders(orders, query) {
+    if (!query) return orders;
+    const q = query.toLowerCase();
+    return orders.filter(order =>
+        order.id.toLowerCase().includes(q) ||
+        order.status.toLowerCase().includes(q) ||
+        (order.items || []).some(item => item.name.toLowerCase().includes(q))
+    );
+}
+
+function applyFiltersAndRender() {
+    const filtered = searchOrders(filterOrders(allOrders, currentFilter), currentSearchQuery);
+    renderOrders(filtered);
 }
 
 /**
@@ -234,7 +317,7 @@ function sortOrders(orders, sortBy) {
 window.toggleSort = function() {
     currentSort = currentSort === 'date' ? 'status' : 'date';
     updateSortButton();
-    renderOrders(filterOrders(allOrders, currentFilter));
+    applyFiltersAndRender();
 };
 
 /**
@@ -325,9 +408,6 @@ function renderOrders(orders) {
         container.innerHTML = `
             <div class="empty-state">
                 <p>No orders found</p>
-                <p style="font-size: 12px; margin-top: 8px; color: var(--text-tertiary);">
-                    Run sync and process commands to fetch emails
-                </p>
             </div>
         `;
         return;
@@ -342,7 +422,7 @@ function renderOrders(orders) {
         <div class="order-item" data-order-id="${order.id}" onclick="toggleOrderDetails('${order.id}')">
             <div class="order-main">
                 <div class="order-id">${escapeHtml(order.id)}</div>
-                <div class="order-date">${escapeHtml(order.order_date)}</div>
+                <div class="order-date">${escapeHtml(displayDate(order))}</div>
             </div>
             <div class="order-product">${escapeHtml(getProductSummary(order))}</div>
             <div class="order-qty">x${totalQty}</div>
@@ -622,8 +702,13 @@ function setupFilterListeners() {
             // Apply filter
             currentFilter = item.dataset.filter;
             updateHeader();
-            renderOrders(filterOrders(allOrders, currentFilter));
+            applyFiltersAndRender();
         });
+    });
+
+    document.getElementById('search-input').addEventListener('input', (e) => {
+        currentSearchQuery = e.target.value.trim();
+        applyFiltersAndRender();
     });
 }
 

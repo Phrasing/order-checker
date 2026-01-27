@@ -20,6 +20,7 @@ pub const DEFAULT_TOKEN_CACHE_PATH: &str = "token_cache.json";
 /// Gmail API scopes we need
 const GMAIL_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.readonly",
+    "profile",
 ];
 
 /// Type alias for the authenticated Gmail client
@@ -286,4 +287,73 @@ pub async fn authenticate_new_account(
     }
 
     Ok((email, permanent_path))
+}
+
+/// Response from Google's OAuth2 userinfo endpoint
+#[derive(serde::Deserialize)]
+struct UserInfoResponse {
+    picture: Option<String>,
+}
+
+/// Fetch the Google profile picture URL for an account.
+///
+/// Uses the OAuth2 userinfo endpoint which returns the user's public profile picture.
+/// Requires the `profile` scope to be granted.
+pub async fn fetch_profile_picture_url(
+    client_secret_path: &Path,
+    account_auth: &AccountAuth,
+) -> Result<Option<String>> {
+    // Build authenticator to get a valid access token
+    let secret = oauth2::read_application_secret(client_secret_path)
+        .await
+        .context("Failed to read client_secret.json")?;
+
+    let auth = oauth2::InstalledFlowAuthenticator::builder(
+        secret,
+        oauth2::InstalledFlowReturnMethod::HTTPRedirect,
+    )
+    .persist_tokens_to_disk(&account_auth.token_cache_path)
+    .build()
+    .await
+    .context("Failed to build authenticator")?;
+
+    let token = auth
+        .token(GMAIL_SCOPES)
+        .await
+        .context("Failed to get access token for profile picture")?;
+
+    let token_str = token
+        .token()
+        .ok_or_else(|| anyhow!("No access token available"))?;
+
+    // Make HTTP request to Google's userinfo endpoint
+    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("Failed to load native TLS roots")?
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let client = hyper::Client::builder().build(https_connector);
+
+    let request = hyper::Request::builder()
+        .uri("https://www.googleapis.com/oauth2/v3/userinfo")
+        .header("Authorization", format!("Bearer {}", token_str))
+        .body(hyper::Body::empty())
+        .context("Failed to build userinfo request")?;
+
+    let response = client
+        .request(request)
+        .await
+        .context("Failed to fetch userinfo")?;
+
+    let body_bytes = hyper::body::to_bytes(response.into_body())
+        .await
+        .context("Failed to read userinfo response body")?;
+
+    let user_info: UserInfoResponse =
+        serde_json::from_slice(&body_bytes).context("Failed to parse userinfo response")?;
+
+    Ok(user_info.picture)
 }

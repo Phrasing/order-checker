@@ -6,8 +6,9 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
-use tokio::sync::Mutex;
+use walmart_dashboard::auth::{AccountAuth, get_gmail_client_for_account, fetch_profile_picture_url};
 use walmart_dashboard::db::Database;
+use walmart_dashboard::ingestion;
 use walmart_dashboard::process;
 use walmart_dashboard::tracking::{self, TrackingService};
 use walmart_dashboard::web::{
@@ -16,8 +17,9 @@ use walmart_dashboard::web::{
 
 /// Application state managed by Tauri
 pub struct AppState {
-    pub db: Arc<Mutex<Database>>,
+    pub db: Arc<Database>,
     pub db_path: PathBuf,
+    pub client_secret_path: PathBuf,
     pub tracking_service: TrackingService,
 }
 
@@ -31,10 +33,8 @@ pub async fn get_dashboard(
     start_date: Option<String>,
     end_date: Option<String>,
 ) -> Result<DashboardData, String> {
-    let db = state.db.lock().await;
-
     get_dashboard_data_with_dates(
-        &db,
+        &state.db,
         account_id,
         start_date.as_deref(),
         end_date.as_deref(),
@@ -59,8 +59,7 @@ pub async fn refresh_dashboard(
 pub async fn list_accounts(
     state: State<'_, AppState>,
 ) -> Result<Vec<AccountViewModel>, String> {
-    let db = state.db.lock().await;
-    fetch_account_view_models(&db)
+    fetch_account_view_models(&state.db)
         .await
         .map_err(|e| e.to_string())
 }
@@ -100,9 +99,7 @@ pub async fn get_tracking_status(
     state: State<'_, AppState>,
     order_id: String,
 ) -> Result<Option<TrackingStatusResponse>, String> {
-    let db = state.db.lock().await;
-
-    let tracking_list = tracking::get_tracking_for_order(&db, &order_id)
+    let tracking_list = tracking::get_tracking_for_order(&state.db, &order_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -138,14 +135,12 @@ pub async fn fetch_tracking(
         "Fetch tracking command invoked"
     );
 
-    let db = state.db.lock().await;
-
     // Get order tracking info
     let order: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT tracking_number, carrier FROM orders WHERE id = ?"
     )
     .bind(&order_id)
-    .fetch_optional(db.pool())
+    .fetch_optional(state.db.pool())
     .await
     .map_err(|e| e.to_string())?;
 
@@ -161,7 +156,7 @@ pub async fn fetch_tracking(
             // Use recovery method for resilience against session issues
             let result = state
                 .tracking_service
-                .get_tracking_status_with_recovery(&db, &tracking_number, &carrier, true)
+                .get_tracking_status_with_recovery(&state.db, &tracking_number, &carrier, true)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -241,9 +236,7 @@ pub struct ProcessResult {
 pub async fn process_emails(
     state: State<'_, AppState>,
 ) -> Result<ProcessResult, String> {
-    let db = state.db.lock().await;
-
-    let stats = process::process_pending_events(&db)
+    let stats = process::process_pending_events(&state.db)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -258,4 +251,185 @@ pub async fn process_emails(
             stats.processed, stats.total_pending, stats.failed, stats.skipped
         ),
     })
+}
+
+// ==================== Sync Commands ====================
+
+/// Result from syncing and processing orders
+#[derive(Serialize)]
+pub struct SyncResult {
+    pub success: bool,
+    pub emails_synced: usize,
+    pub orders_processed: usize,
+    pub errors: Vec<String>,
+    pub message: String,
+}
+
+/// Internal sync+process logic (separated from tauri command to avoid State lifetime issues)
+async fn perform_sync_and_process(
+    db: Arc<Database>,
+    db_path: PathBuf,
+    client_secret_path: PathBuf,
+    tracking_service: TrackingService,
+) -> Result<SyncResult, String> {
+    let mut errors = Vec::new();
+    let mut total_synced = 0usize;
+
+    // Resolve the base directory for token cache files (same directory as the database)
+    let base_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+    // Get all active accounts
+    let accounts = db.list_accounts().await.map_err(|e| e.to_string())?;
+
+    if accounts.is_empty() {
+        return Ok(SyncResult {
+            success: false,
+            emails_synced: 0,
+            orders_processed: 0,
+            errors: vec!["No accounts configured. Use CLI to add an account.".to_string()],
+            message: "No accounts configured".to_string(),
+        });
+    }
+
+    // Sync each account
+    for acc in &accounts {
+        if !acc.is_active {
+            continue;
+        }
+
+        tracing::info!(email = %acc.email, "Syncing emails for account");
+
+        // Resolve token cache path relative to the database directory
+        // (tokens are created by CLI in the project root alongside orders.db)
+        let token_path = PathBuf::from(&acc.token_cache_path);
+        let resolved_token_path = if token_path.is_absolute() {
+            token_path
+        } else {
+            base_dir.join(token_path)
+        };
+
+        tracing::debug!(
+            email = %acc.email,
+            token_path = %resolved_token_path.display(),
+            "Resolved token cache path"
+        );
+
+        // Create AccountAuth from resolved token path
+        let account_auth = AccountAuth::with_path(
+            &acc.email,
+            resolved_token_path,
+        );
+
+        // Get Gmail client for this account
+        match get_gmail_client_for_account(&client_secret_path, &account_auth).await {
+            Ok(gmail_client) => {
+                // Sync emails from last 5 days
+                match ingestion::sync_emails_with_days_and_account(
+                    &db,
+                    gmail_client,
+                    5,
+                    acc.id,
+                ).await {
+                    Ok(stats) => {
+                        total_synced += stats.synced;
+                        tracing::info!(
+                            email = %acc.email,
+                            synced = stats.synced,
+                            skipped = stats.skipped,
+                            "Sync completed for account"
+                        );
+
+                        // Update last_sync_at timestamp
+                        if let Err(e) = db.update_account_last_sync(acc.id).await {
+                            tracing::warn!(email = %acc.email, error = %e, "Failed to update last_sync_at");
+                        }
+
+                        // Refresh profile picture URL
+                        match fetch_profile_picture_url(&client_secret_path, &account_auth).await {
+                            Ok(pic_url) => {
+                                if let Err(e) = db.update_account_profile_picture(acc.id, pic_url.as_deref()).await {
+                                    tracing::warn!(email = %acc.email, error = %e, "Failed to save profile picture URL");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(email = %acc.email, error = %e, "Failed to fetch profile picture");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = format!("Sync failed for {}: {}", acc.email, e);
+                        tracing::error!("{}", err_msg);
+                        errors.push(err_msg);
+                    }
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("Auth failed for {}: {}", acc.email, e);
+                tracing::error!("{}", err_msg);
+                errors.push(err_msg);
+            }
+        }
+    }
+
+    // Process all pending emails into orders
+    let process_stats = process::process_pending_events(&db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Fetch tracking info for any orders that are missing it
+    if let Err(e) = tracking::fetch_missing_tracking_batch(&db, &tracking_service).await {
+        let err_msg = format!("Tracking fetch failed: {}", e);
+        tracing::error!("{}", err_msg);
+        errors.push(err_msg);
+    }
+
+    // Sync order statuses from tracking data (e.g. shipped -> delivered)
+    if let Err(e) = tracking::sync_delivered_from_tracking(&db).await {
+        tracing::warn!("Failed to sync delivered orders from tracking: {}", e);
+    }
+
+    let success = errors.is_empty();
+    let message = if success {
+        format!(
+            "Synced {} emails, processed {} orders",
+            total_synced, process_stats.processed
+        )
+    } else {
+        format!(
+            "Synced {} emails, processed {} orders ({} errors)",
+            total_synced, process_stats.processed, errors.len()
+        )
+    };
+
+    Ok(SyncResult {
+        success,
+        emails_synced: total_synced,
+        orders_processed: process_stats.processed,
+        errors,
+        message,
+    })
+}
+
+/// Sync emails from Gmail and process them into orders
+/// This combines the sync + process workflow into a single command
+#[tauri::command]
+pub async fn sync_and_process_orders(
+    state: State<'_, AppState>,
+) -> Result<SyncResult, String> {
+    let db = Arc::clone(&state.db);
+    let db_path = state.db_path.clone();
+    let client_secret_path = state.client_secret_path.clone();
+    let tracking_service = state.tracking_service.clone();
+
+    // Run sync in a dedicated thread to avoid HRTB Send issues with the
+    // tauri command macro (library futures contain non-Send-for-all-lifetimes types)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+
+    std::thread::spawn(move || {
+        let result = handle.block_on(perform_sync_and_process(db, db_path, client_secret_path, tracking_service));
+        let _ = tx.send(result);
+    });
+
+    rx.await.map_err(|_| "Sync task failed".to_string())?
 }

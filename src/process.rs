@@ -498,6 +498,11 @@ async fn apply_shipping(
     // Update order status to shipped
     update_order_status(db, &order.id, OrderStatus::Shipped).await?;
 
+    // Record the shipped date from the email's gmail_date
+    if let Some(ref gmail_date) = email.gmail_date {
+        update_shipped_date(db, &order.id, gmail_date).await?;
+    }
+
     // Update tracking info if available
     if let (Some(tracking), Some(carrier)) = (&order.tracking_number, &order.carrier) {
         update_order_tracking(db, &order.id, tracking, carrier).await?;
@@ -637,6 +642,11 @@ async fn apply_shipping_tx<'a>(
 ) -> Result<()> {
     insert_order_tx(tx, order).await?;
     update_order_status_tx(tx, &order.id, OrderStatus::Shipped).await?;
+
+    // Record the shipped date from the email's gmail_date
+    if let Some(ref gmail_date) = email.gmail_date {
+        update_shipped_date_tx(tx, &order.id, gmail_date).await?;
+    }
 
     if let (Some(tracking), Some(carrier)) = (&order.tracking_number, &order.carrier) {
         update_order_tracking_tx(tx, &order.id, tracking, carrier).await?;
@@ -787,6 +797,25 @@ async fn update_order_tracking(
     sqlx::query("UPDATE orders SET tracking_number = ?, carrier = ? WHERE id = ?")
         .bind(tracking_number)
         .bind(carrier)
+        .bind(order_id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+fn millis_to_rfc3339(millis_str: &str) -> String {
+    millis_str
+        .parse::<i64>()
+        .ok()
+        .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms))
+        .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339())
+        .unwrap_or_else(|| millis_str.to_string())
+}
+
+async fn update_shipped_date(db: &Database, order_id: &str, shipped_date: &str) -> Result<()> {
+    let formatted = millis_to_rfc3339(shipped_date);
+    sqlx::query("UPDATE orders SET shipped_date = ? WHERE id = ? AND shipped_date IS NULL")
+        .bind(&formatted)
         .bind(order_id)
         .execute(db.pool())
         .await?;
@@ -1020,6 +1049,20 @@ async fn update_order_tracking_tx<'a>(
     Ok(())
 }
 
+async fn update_shipped_date_tx<'a>(
+    tx: &mut sqlx::Transaction<'a, Sqlite>,
+    order_id: &str,
+    shipped_date: &str,
+) -> Result<()> {
+    let formatted = millis_to_rfc3339(shipped_date);
+    sqlx::query("UPDATE orders SET shipped_date = ? WHERE id = ? AND shipped_date IS NULL")
+        .bind(&formatted)
+        .bind(order_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn cancel_all_items_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     order_id: &str,
@@ -1161,7 +1204,7 @@ async fn batch_mark_emails_processed(db: &Database, ids: &[i64]) -> Result<()> {
     for chunk in ids.chunks(CHUNK_SIZE) {
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
         let query = format!(
-            "UPDATE raw_emails SET processing_status = 'processed', processed_at = datetime('now') WHERE id IN ({})",
+            "UPDATE raw_emails SET processing_status = 'processed', processed_at = datetime('now'), raw_body = '' WHERE id IN ({})",
             placeholders.join(", ")
         );
 
@@ -1184,7 +1227,7 @@ async fn batch_mark_emails_skipped(db: &Database, ids: &[i64]) -> Result<()> {
     for chunk in ids.chunks(CHUNK_SIZE) {
         let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
         let query = format!(
-            "UPDATE raw_emails SET processing_status = 'skipped', processed_at = datetime('now') WHERE id IN ({})",
+            "UPDATE raw_emails SET processing_status = 'skipped', processed_at = datetime('now'), raw_body = '' WHERE id IN ({})",
             placeholders.join(", ")
         );
 
@@ -1208,7 +1251,7 @@ async fn batch_mark_emails_failed(db: &Database, entries: &[(i64, String)]) -> R
     let mut tx = db.pool().begin().await?;
     for (id, error) in entries {
         sqlx::query(
-            "UPDATE raw_emails SET processing_status = 'failed', error_message = ?, processed_at = datetime('now') WHERE id = ?"
+            "UPDATE raw_emails SET processing_status = 'failed', error_message = ?, processed_at = datetime('now'), raw_body = '' WHERE id = ?"
         )
         .bind(error)
         .bind(*id)

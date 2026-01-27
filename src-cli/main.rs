@@ -390,40 +390,45 @@ async fn main() -> Result<()> {
                 println!("Event Type: {}", event_type);
                 println!("Body length: {} chars", raw_body.len());
 
-                // Show if body is still quoted-printable encoded
-                if raw_body.contains("=3D") || raw_body.contains("=20") {
-                    println!("⚠ Body appears to still be quoted-printable encoded");
-                }
-
-                // Parse email using actual parser
-                let parser = walmart_dashboard::parsing::WalmartEmailParser::new();
-                let order_id = parser.extract_order_id(&raw_body);
-                let total = parser.extract_total_price(&raw_body);
-                let order_date = parser.extract_order_date(&raw_body);
-
-                println!("\n--- Parser results ---");
-                println!("  Order ID: {:?}", order_id);
-                println!("  Total: {:?}", total);
-                println!("  Order Date: {:?}", order_date);
-
-                // If order exists, show current DB value
-                if let Ok(oid) = &order_id {
-                    let db_order: Option<(Option<f64>,)> = sqlx::query_as(
-                        "SELECT total_cost FROM orders WHERE id = ?"
-                    )
-                    .bind(oid)
-                    .fetch_optional(db.pool())
-                    .await?;
-
-                    if let Some((db_total,)) = db_order {
-                        println!("  DB Total: {:?}", db_total);
-                    } else {
-                        println!("  (Order not in DB)");
+                if raw_body.is_empty() {
+                    println!("\nRaw body was cleared after processing.");
+                    println!("Use Gmail API to re-fetch by gmail_id if needed.");
+                } else {
+                    // Show if body is still quoted-printable encoded
+                    if raw_body.contains("=3D") || raw_body.contains("=20") {
+                        println!("Body appears to still be quoted-printable encoded");
                     }
-                }
 
-                println!("\n--- First 500 chars of body ---");
-                println!("{}", &raw_body[..std::cmp::min(500, raw_body.len())]);
+                    // Parse email using actual parser
+                    let parser = walmart_dashboard::parsing::WalmartEmailParser::new();
+                    let order_id = parser.extract_order_id(&raw_body);
+                    let total = parser.extract_total_price(&raw_body);
+                    let order_date = parser.extract_order_date(&raw_body);
+
+                    println!("\n--- Parser results ---");
+                    println!("  Order ID: {:?}", order_id);
+                    println!("  Total: {:?}", total);
+                    println!("  Order Date: {:?}", order_date);
+
+                    // If order exists, show current DB value
+                    if let Ok(oid) = &order_id {
+                        let db_order: Option<(Option<f64>,)> = sqlx::query_as(
+                            "SELECT total_cost FROM orders WHERE id = ?"
+                        )
+                        .bind(oid)
+                        .fetch_optional(db.pool())
+                        .await?;
+
+                        if let Some((db_total,)) = db_order {
+                            println!("  DB Total: {:?}", db_total);
+                        } else {
+                            println!("  (Order not in DB)");
+                        }
+                    }
+
+                    println!("\n--- First 500 chars of body ---");
+                    println!("{}", &raw_body[..std::cmp::min(500, raw_body.len())]);
+                }
             } else {
                 println!("No email found");
             }
@@ -893,10 +898,15 @@ async fn main() -> Result<()> {
 
             let mut updated = 0;
             let mut failed = 0;
+            let mut cleared_bodies = 0;
             let mut order_dates: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
             // First pass: collect dates from all emails
             for (_id, raw_body, _event_type) in &emails {
+                if raw_body.is_empty() {
+                    cleared_bodies += 1;
+                    continue;
+                }
                 if let Ok(order_id) = parser.extract_order_id(raw_body) {
                     // Only use first date found (confirmation emails are first due to ORDER BY)
                     if !order_dates.contains_key(&order_id) {
@@ -908,6 +918,9 @@ async fn main() -> Result<()> {
                 }
             }
 
+            if cleared_bodies > 0 {
+                println!("Skipped {} emails with cleared raw bodies", cleared_bodies);
+            }
             println!("Found dates for {} orders", order_dates.len());
 
             // Second pass: update orders

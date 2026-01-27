@@ -82,6 +82,12 @@ urlencoding = "2"
 # Tracking info from 17track.net (uses headless Chrome)
 track17-rs = { git = "https://github.com/Phrasing/track17-rs", branch = "main" }
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = true
+
 [dev-dependencies]
 tokio-test = "0.4"
 

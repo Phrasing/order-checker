@@ -170,6 +170,142 @@
             background-color: var(--bg-secondary);
         }
 
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .account-area {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .search-input {
+            padding: 6px 10px 6px 28px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 12px;
+            width: 220px;
+            transition: all 0.15s;
+        }
+
+        .search-input::placeholder {
+            color: var(--text-tertiary);
+        }
+
+        .search-input:hover {
+            border-color: var(--text-tertiary);
+        }
+
+        .search-input:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+
+        .search-wrapper {
+            position: relative;
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 9px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-tertiary);
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        .header-account-select {
+            padding: 6px 10px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 12px;
+            cursor: pointer;
+            min-width: 140px;
+        }
+
+        .header-account-select:hover {
+            border-color: var(--text-tertiary);
+        }
+
+        .header-account-select:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
+
+        .account-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            border: 2px solid var(--border-color);
+            object-fit: cover;
+            transition: border-color 0.15s;
+        }
+
+        .account-avatar:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .account-avatar-fallback {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: var(--bg-tertiary);
+            border: 2px solid var(--border-color);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            transition: border-color 0.15s;
+        }
+
+        .account-avatar-fallback:hover {
+            border-color: var(--accent-blue);
+        }
+
+        .sync-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            background: var(--accent-blue);
+            border: none;
+            border-radius: 6px;
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .sync-btn:hover {
+            background: #0066d6;
+        }
+
+        .sync-btn:disabled {
+            background: var(--bg-tertiary);
+            color: var(--text-tertiary);
+            cursor: not-allowed;
+        }
+
+        .sync-btn .sync-icon {
+            font-size: 14px;
+            transition: transform 0.3s;
+        }
+
+        .sync-btn.loading .sync-icon {
+            animation: spin 1s linear infinite;
+        }
+
         .content-title {
             font-size: 13px;
             font-weight: 600;
@@ -561,51 +697,6 @@
             to { transform: rotate(360deg); }
         }
 
-        /* Account selector */
-        .account-section {
-            padding: 12px 10px;
-            border-top: 1px solid var(--border-color);
-            margin-top: 16px;
-        }
-
-        .account-select {
-            width: 100%;
-            padding: 8px 10px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-primary);
-            font-size: 12px;
-            cursor: pointer;
-            -webkit-appearance: none;
-            -moz-appearance: none;
-            appearance: none;
-            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2398989d' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
-            background-repeat: no-repeat;
-            background-position: right 8px center;
-            background-size: 16px;
-            padding-right: 32px;
-        }
-
-        .account-select:hover {
-            border-color: var(--text-tertiary);
-        }
-
-        .account-select:focus {
-            outline: none;
-            border-color: var(--accent-blue);
-        }
-
-        .account-select option {
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            padding: 8px;
-        }
-
-        .account-section .filter-label {
-            margin-bottom: 8px;
-        }
-
         /* Date range presets */
         .date-presets {
             display: flex;
@@ -710,15 +801,6 @@
                 </div>
             </div>
 
-            <!-- Account Selector -->
-            <div class="account-section" id="account-section" style="display: none;">
-                <div class="filter-label">Account</div>
-                <select id="account-select" class="account-select" onchange="handleAccountChange(this.value)">
-                    <option value="">All Accounts</option>
-                    <!-- Populated dynamically -->
-                </select>
-            </div>
-
             <div style="margin-top: auto; padding: 8px; font-size: 11px; color: var(--text-tertiary);">
                 <span id="pending-emails">-- pending</span>
             </div>
@@ -731,7 +813,23 @@
                     <div class="content-title" id="filter-title">All Orders</div>
                     <div class="content-subtitle" id="last-updated">Loading...</div>
                 </div>
-                <button id="sort-toggle" class="sort-btn" onclick="toggleSort()">Sort: Date</button>
+                <div class="search-wrapper">
+                    <span class="search-icon">⌕</span>
+                    <input id="search-input" class="search-input" type="text" placeholder="Search orders, products, status...">
+                </div>
+                <div class="header-controls">
+                    <button id="sync-btn" class="sync-btn" onclick="syncOrders()">
+                        <span class="sync-icon">↻</span> Sync
+                    </button>
+                    <div class="account-area">
+                        <select id="account-select" class="header-account-select" onchange="handleAccountChange(this.value)" style="display: none;">
+                            <option value="">All Accounts</option>
+                        </select>
+                        <img id="account-avatar" class="account-avatar" src="" alt="" style="display: none;"
+                             onerror="this.style.display='none'; document.getElementById('account-avatar-fallback').style.display='flex';">
+                        <div id="account-avatar-fallback" class="account-avatar-fallback" style="display: none;"></div>
+                    </div>
+                </div>
             </div>
 
             <div class="order-list" id="order-list">

@@ -16,7 +16,24 @@ use crate::models::{ItemStatus, LineItem, OrderStatus, WalmartOrder};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
+use std::sync::OnceLock;
 use thiserror::Error;
+
+/// Cached fallback regex for order ID extraction (compiled once)
+fn fallback_order_id_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"#(\d{7,}-\d{5,})").expect("Invalid fallback regex"))
+}
+
+/// Cached nested span regex for order ID extraction (compiled once)
+fn nested_span_order_id_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)order\s*(?:number|#|num\.?)?[:\s]*<a[^>]*>\s*<span[^>]*>([0-9\-]{10,})</span>"
+        ).expect("Invalid nested span regex")
+    })
+}
 
 #[derive(Error, Debug)]
 pub enum ParseError {
@@ -158,9 +175,7 @@ impl WalmartEmailParser {
         }
 
         // Fallback: Try to find #XXXXXXX-XXXXXXXX format (used in delivery emails)
-        // This pattern matches order IDs prefixed with # inside HTML tags
-        let fallback_pattern = Regex::new(r"#(\d{7,}-\d{5,})").expect("Invalid fallback regex");
-        if let Some(captures) = fallback_pattern.captures(html) {
+        if let Some(captures) = fallback_order_id_pattern().captures(html) {
             if let Some(id_match) = captures.get(1) {
                 let raw_id = id_match.as_str();
                 let normalized = WalmartOrder::normalize_id(raw_id);
@@ -169,11 +184,7 @@ impl WalmartEmailParser {
         }
 
         // Fallback: Order ID nested in <span> inside <a> tag (delivery cancellation emails)
-        // Pattern: Order number: <a href="..."><span style="...">2000143-29028812</span></a>
-        let nested_span_pattern = Regex::new(
-            r"(?i)order\s*(?:number|#|num\.?)?[:\s]*<a[^>]*>\s*<span[^>]*>([0-9\-]{10,})</span>"
-        ).expect("Invalid nested span regex");
-        if let Some(captures) = nested_span_pattern.captures(html) {
+        if let Some(captures) = nested_span_order_id_pattern().captures(html) {
             if let Some(id_match) = captures.get(1) {
                 let raw_id = id_match.as_str();
                 let normalized = WalmartOrder::normalize_id(raw_id);
@@ -446,7 +457,8 @@ impl WalmartEmailParser {
         let mut earliest_pos = html.len();
 
         for marker in p13n_markers {
-            if let Some(pos) = lower_html.find(&marker.to_lowercase()) {
+            // Markers are already lowercase, no need to re-lowercase them
+            if let Some(pos) = lower_html.find(marker) {
                 if pos < earliest_pos {
                     earliest_pos = pos;
                 }
@@ -467,9 +479,8 @@ impl WalmartEmailParser {
                 let row_text: String = row.text().collect();
 
                 // Skip header rows and non-product rows
-                if row_text.to_lowercase().contains("item")
-                    && row_text.to_lowercase().contains("price")
-                {
+                let lower_row = row_text.to_lowercase();
+                if lower_row.contains("item") && lower_row.contains("price") {
                     continue;
                 }
 
