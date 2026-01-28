@@ -76,6 +76,8 @@ pub struct WalmartEmailParser {
     date_pattern: Regex,
     // Pattern to extract items from img alt attributes (shipping emails)
     alt_item_pattern: Regex,
+    // Fuzzy match for itemName-* class pattern (store delivery emails)
+    item_name_class_pattern: Regex,
     // Pattern to extract tracking number and carrier from shipping emails
     // Matches: "Fedex tracking number 123456" or "UPS tracking number <a...>123456</a>"
     tracking_pattern: Regex,
@@ -124,6 +126,12 @@ impl WalmartEmailParser {
                 r#"alt\s*=\s*["']quantity\s+(\d+)\s+item\s+([^"']+)["']"#
             ).expect("Invalid alt item regex"),
 
+            // Fuzzy match for itemName-* class pattern (store delivery emails)
+            // These use "itemName-0-861324-47" instead of "productName-0-36726-75"
+            item_name_class_pattern: Regex::new(
+                r"(?i)itemName[a-zA-Z0-9_-]*"
+            ).expect("Invalid item name class regex"),
+
             // Pattern to extract tracking number and carrier from shipping emails
             // Matches: "Fedex tracking number 123456" or "UPS tracking number <a...>123456</a>"
             // Carriers: FedEx, UPS, USPS, OnTrac
@@ -149,7 +157,7 @@ impl WalmartEmailParser {
             || lower.contains("was cancelled")
         {
             EmailType::Cancellation
-        } else if lower.contains("delivered") || lower.contains("has arrived") || lower.contains("package arrived") || lower.contains("items arrived") {
+        } else if lower.contains("delivered") || lower.contains("has arrived") || lower.contains("package arrived") || lower.contains("item arrived") {
             // IMPORTANT: Check delivery BEFORE shipping, because delivery emails often contain
             // "Sold and shipped by Walmart" which would match the shipping check
             EmailType::Delivery
@@ -356,6 +364,13 @@ impl WalmartEmailParser {
             return items;
         }
 
+        // Strategy 1.5: Extract items from itemName-* class (store delivery emails)
+        // Store deliveries use "itemName-0-861324-47" instead of "productName-*"
+        let items = self.extract_items_from_item_name_class(html);
+        if !items.is_empty() {
+            return items;
+        }
+
         let mut items = Vec::new();
 
         // Strategy 2: Look for productName-* class pattern, but ONLY before the p13n section
@@ -439,6 +454,109 @@ impl WalmartEmailParser {
         items
     }
 
+    /// Extract items from itemName-* class elements (store delivery emails)
+    /// These use a different class naming scheme than productName-* (confirmation emails)
+    /// Structure: <span class="itemName-0-861324-47">Product Name</span>
+    ///   with sibling cells containing "$499.00/EA", "Qty: 1", and image
+    fn extract_items_from_item_name_class(&self, html: &str) -> Vec<LineItem> {
+        let document = Html::parse_document(html);
+        let mut items = Vec::new();
+
+        let all_selector = match Selector::parse("*") {
+            Ok(sel) => sel,
+            Err(_) => return items,
+        };
+
+        for element in document.select(&all_selector) {
+            if let Some(class) = element.value().attr("class") {
+                if !self.item_name_class_pattern.is_match(class) {
+                    continue;
+                }
+
+                let name = Self::get_element_text(&element);
+                if name.is_empty() || name.len() <= 2 {
+                    continue;
+                }
+
+                let mut item = LineItem::new(name, 1);
+
+                // Walk up to a <tr> ancestor that contains price info.
+                // Store delivery emails have nested tables, so the immediate <tr>
+                // may only contain the item name. We need the outer <tr> that spans
+                // all three columns (image, details, price).
+                // For canceled/pickup emails with no price, fall back to nearest <tr>.
+                let mut ancestor = element.parent();
+                let mut row_ref: Option<ElementRef> = None;
+                let mut nearest_tr: Option<ElementRef> = None;
+                for _depth in 0..10 {
+                    match ancestor {
+                        Some(node) => {
+                            if let Some(elem) = ElementRef::wrap(node) {
+                                if elem.value().name() == "tr" {
+                                    if nearest_tr.is_none() {
+                                        nearest_tr = Some(elem);
+                                    }
+                                    let text: String = elem.text().collect();
+                                    if text.contains('$') {
+                                        row_ref = Some(elem);
+                                        break;
+                                    }
+                                }
+                            }
+                            ancestor = node.parent();
+                        }
+                        None => break,
+                    }
+                }
+
+                // Fall back to nearest <tr> when no price-containing row found
+                if row_ref.is_none() {
+                    row_ref = nearest_tr;
+                }
+
+                if let Some(row) = row_ref {
+                    let row_text: String = row.text().collect();
+
+                    // Extract price from row text (look for $XXX.XX)
+                    if let Some(price) = self.extract_first_price(&row_text) {
+                        item = item.with_price(price);
+                    }
+
+                    // Extract quantity from "Qty: N" pattern
+                    let lower_text = row_text.to_lowercase();
+                    if let Some(qty_pos) = lower_text.find("qty:") {
+                        let after_qty = &row_text[qty_pos + 4..];
+                        let qty_str: String = after_qty.trim().chars()
+                            .take_while(|chr| chr.is_ascii_digit())
+                            .collect();
+                        if let Ok(qty) = qty_str.parse::<u32>() {
+                            if qty > 0 {
+                                item.quantity = qty;
+                            }
+                        }
+                    }
+
+                    // Extract image URL from <img> in the row
+                    if let Ok(img_sel) = Selector::parse("img") {
+                        for img in row.select(&img_sel) {
+                            if let Some(src) = img.value().attr("src") {
+                                // Skip tracking pixels and tiny spacer images
+                                if src.contains("walmartimages.com") && !src.contains("/dfw/") {
+                                    item = item.with_image(src.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                items.push(item);
+            }
+        }
+
+        items
+    }
+
     /// Get HTML content before the recommendations/personalization section
     /// The p13n-module section contains recommended products, not order items
     fn get_html_before_recommendations(&self, html: &str) -> String {
@@ -447,10 +565,12 @@ impl WalmartEmailParser {
             "automation-id=\"p13n-module\"",
             "automation-id='p13n-module'",
             "p13n-products",
-            "You might also like",
-            "Recommended for you",
-            "More from Walmart",
-            "Based on your order",
+            "you might also like",
+            "recommended for you",
+            "more from walmart",
+            "based on your order",
+            // Store delivery emails use "athznid=ContinueYourShopping" in recommendation URLs
+            "continueyourshopping",
         ];
 
         let lower_html = html.to_lowercase();
@@ -856,5 +976,380 @@ mod tests {
         let total = parser.extract_total_price(html);
         assert!(total.is_some(), "Should extract total from 'includes all fees' pattern");
         assert!((total.unwrap() - 106.84).abs() < 0.01, "Total should be $106.84");
+    }
+
+    /// Sample store delivery email HTML — uses itemName-* classes and #ORDER-ID format
+    fn sample_store_delivery_html() -> &'static str {
+        r#"
+        <html>
+        <body>
+            <div>Your package arrived, Mark!</div>
+            <div>completed your delivery from store at 6:49am on Thu, Jun 5</div>
+
+            <div>
+                <p>Order date: Thu, Apr 24, 2025</p>
+                <p>Order&nbsp;<a href="https://example.com/track">
+                    <span style="color:#6d6e71 !important;">#2000132-35127884</span>
+                </a></p>
+            </div>
+
+            <table>
+            <tr>
+                <td valign="top" width="76px">
+                    <img class="item-image" aria-hidden="true"
+                         src="https://i5.walmartimages.com/seo/Nintendo-Switch-2.jpeg"
+                         alt="item image" height="60" />
+                </td>
+                <td valign="top">
+                    <table>
+                        <tr><td><span class="itemName-0-861324-47">Nintendo Switch 2 + Mario Kart World Bundle</span></td></tr>
+                        <tr><td>Preorder</td></tr>
+                        <tr><td>$499.00/EA</td></tr>
+                        <tr><td>Qty: 1</td></tr>
+                    </table>
+                </td>
+                <td align="right" valign="top">
+                    <table>
+                        <tr><td class="price-0-861324-48" align="right"><span style="font-weight:bold;">$499.00</span></td></tr>
+                    </table>
+                </td>
+            </tr>
+            </table>
+
+            <!-- Recommendation section (should be ignored) -->
+            <div>
+                <img data-tracking="p13n" href="https://example.com?athznid=ContinueYourShopping" />
+                <a class="productName-0-861324-86" href="https://example.com">Recommended Product</a>
+            </div>
+        </body>
+        </html>
+        "#
+    }
+
+    #[test]
+    fn test_store_delivery_email_type() {
+        let parser = WalmartEmailParser::new();
+        assert_eq!(
+            parser.detect_email_type(sample_store_delivery_html()),
+            EmailType::Delivery
+        );
+    }
+
+    #[test]
+    fn test_store_delivery_order_id() {
+        let parser = WalmartEmailParser::new();
+        let order_id = parser
+            .extract_order_id(sample_store_delivery_html())
+            .expect("Should extract order ID from store delivery email");
+        assert_eq!(order_id, "200013235127884");
+    }
+
+    #[test]
+    fn test_store_delivery_item_extraction() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_store_delivery_html());
+
+        assert_eq!(items.len(), 1, "Should extract exactly 1 item");
+        assert!(
+            items[0].name.contains("Nintendo Switch"),
+            "Item name should contain 'Nintendo Switch', got: {}",
+            items[0].name
+        );
+        assert_eq!(items[0].quantity, 1);
+        assert!(items[0].price.is_some(), "Should extract price");
+        assert!(
+            (items[0].price.unwrap() - 499.0).abs() < 0.01,
+            "Price should be $499.00"
+        );
+    }
+
+    #[test]
+    fn test_store_delivery_ignores_recommendations() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_store_delivery_html());
+
+        // Should NOT contain recommendation products
+        for item in &items {
+            assert!(
+                !item.name.contains("Recommended"),
+                "Should not extract recommended products, found: {}",
+                item.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_store_delivery_full_parse() {
+        let parser = WalmartEmailParser::new();
+        let order = parser
+            .parse_order(sample_store_delivery_html())
+            .expect("Should parse store delivery order");
+
+        assert_eq!(order.id, "200013235127884");
+        assert_eq!(order.status, OrderStatus::Delivered);
+        assert!(!order.items.is_empty(), "Should have items");
+        for item in &order.items {
+            assert_eq!(item.status, ItemStatus::Delivered);
+        }
+    }
+
+    /// Sample canceled pickup email HTML — uses itemName-* classes, no price shown
+    fn sample_canceled_pickup_html() -> &'static str {
+        r#"
+        <html>
+        <body>
+            <h1>dawn's pickup was canceled</h1>
+            <div>
+                <span style="font-size:14px;">Order number: 2000133-31515436</span>
+            </div>
+            <div>1 item canceled</div>
+
+            <table width="100%">
+            <tr><td>
+                <table role="presentation" width="100%">
+                <tr><td colspan="3" height="16"></td></tr>
+                <tr>
+                    <td class="imageContainer-0-303428-15" valign="top" width="76px">
+                        <div>
+                            <img class="item-image" aria-hidden="true"
+                                 src="https://i5.walmartimages.com/seo/EverStart-Battery.jpeg"
+                                 alt="item image" height="60" />
+                        </div>
+                    </td>
+                    <td valign="top">
+                        <table role="presentation">
+                            <tr><td class="pb6-0-303428-16">
+                                <span class="itemName-0-303428-19">EverStart Plus Lead Acid Automotive Battery, Group Size 96R 12 Volt, 590 CCA</span>
+                            </td></tr>
+                            <tr><td class="textGrey-0-303428-17">Qty: 1</td></tr>
+                        </table>
+                    </td>
+                </tr>
+                </table>
+            </td></tr>
+            </table>
+        </body>
+        </html>
+        "#
+    }
+
+    #[test]
+    fn test_canceled_pickup_email_type() {
+        let parser = WalmartEmailParser::new();
+        assert_eq!(
+            parser.detect_email_type(sample_canceled_pickup_html()),
+            EmailType::Cancellation
+        );
+    }
+
+    #[test]
+    fn test_canceled_pickup_order_id() {
+        let parser = WalmartEmailParser::new();
+        let order_id = parser
+            .extract_order_id(sample_canceled_pickup_html())
+            .expect("Should extract order ID from canceled pickup email");
+        assert_eq!(order_id, "200013331515436");
+    }
+
+    #[test]
+    fn test_canceled_pickup_item_extraction() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_canceled_pickup_html());
+
+        assert_eq!(items.len(), 1, "Should extract exactly 1 item");
+        assert!(
+            items[0].name.contains("EverStart"),
+            "Item name should contain 'EverStart', got: {}",
+            items[0].name
+        );
+        assert_eq!(items[0].quantity, 1);
+        // No price in canceled pickup emails
+        assert!(items[0].price.is_none(), "Canceled pickup should have no price");
+    }
+
+    #[test]
+    fn test_canceled_pickup_full_parse() {
+        let parser = WalmartEmailParser::new();
+        let order = parser
+            .parse_order(sample_canceled_pickup_html())
+            .expect("Should parse canceled pickup order");
+
+        assert_eq!(order.id, "200013331515436");
+        // parse_order returns PartiallyCanceled when items are present —
+        // apply_cancellation_tx later checks DB state to promote to Canceled
+        assert_eq!(order.status, OrderStatus::PartiallyCanceled);
+        assert!(!order.items.is_empty(), "Should have items");
+        for item in &order.items {
+            assert_eq!(item.status, ItemStatus::Canceled);
+        }
+    }
+
+    /// Alternate delivery-from-store email — says "item arrived" (singular),
+    /// NOT "package arrived" or "delivered". Has tracking URLs that could
+    /// false-match as Shipping if delivery detection misses it.
+    fn sample_alternate_delivery_html() -> &'static str {
+        r#"
+        <html>
+        <body>
+            <h2>1 item arrived</h2>
+
+            <div>
+                <p>Order date: Sat, Sep 27, 2025</p>
+                <p>Order&nbsp;<a href="https://example.com/track">
+                    <span style="color:#6d6e71 !important;">#2000138-35586017</span>
+                </a></p>
+            </div>
+
+            <a href="https://w-mt.co/g/rptrcks/comm-smart-app/services/tracking/click">Track</a>
+
+            <table>
+            <tr>
+                <td valign="top" width="76px">
+                    <img class="item-image" aria-hidden="true"
+                         src="https://i5.walmartimages.com/seo/Hyper-Tough-Trolley-Jack.jpeg"
+                         alt="item image" height="60" />
+                </td>
+                <td valign="top">
+                    <table role="presentation">
+                        <tr><td><span class="itemName-0-355797-47">Hyper Tough T82011W Trolley Jack, 2 Ton Black and Red</span></td></tr>
+                        <tr><td>$41.97/EA</td></tr>
+                        <tr><td>Qty: 1</td></tr>
+                    </table>
+                </td>
+                <td align="right" valign="top">
+                    <table>
+                        <tr><td class="price-0-355797-48" align="right"><span style="font-weight:bold;">$41.97</span></td></tr>
+                    </table>
+                </td>
+            </tr>
+            </table>
+
+            <!-- Recommendation section -->
+            <table align="center" automation-id="p13n-module" border="0">
+                <tr><td>
+                    <a class="productName-0-355797-88" href="https://example.com">Recommended Product</a>
+                </td></tr>
+            </table>
+        </body>
+        </html>
+        "#
+    }
+
+    #[test]
+    fn test_alternate_delivery_email_type() {
+        let parser = WalmartEmailParser::new();
+        // Must detect as Delivery, NOT Shipping (despite "tracking" in URLs)
+        assert_eq!(
+            parser.detect_email_type(sample_alternate_delivery_html()),
+            EmailType::Delivery
+        );
+    }
+
+    #[test]
+    fn test_alternate_delivery_order_id() {
+        let parser = WalmartEmailParser::new();
+        let order_id = parser
+            .extract_order_id(sample_alternate_delivery_html())
+            .expect("Should extract order ID");
+        assert_eq!(order_id, "200013835586017");
+    }
+
+    #[test]
+    fn test_alternate_delivery_item_extraction() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_alternate_delivery_html());
+
+        assert_eq!(items.len(), 1, "Should extract exactly 1 item");
+        assert!(
+            items[0].name.contains("Hyper Tough"),
+            "Item name should contain 'Hyper Tough', got: {}",
+            items[0].name
+        );
+        assert_eq!(items[0].quantity, 1);
+        assert!(items[0].price.is_some(), "Should extract price");
+        assert!(
+            (items[0].price.unwrap() - 41.97).abs() < 0.01,
+            "Price should be $41.97"
+        );
+    }
+
+    #[test]
+    fn test_alternate_delivery_ignores_recommendations() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_alternate_delivery_html());
+
+        for item in &items {
+            assert!(
+                !item.name.contains("Recommended"),
+                "Should not extract recommended products, found: {}",
+                item.name
+            );
+        }
+    }
+
+    // ===== Preorder confirmation email tests =====
+
+    fn sample_preorder_confirmation_html() -> &'static str {
+        r#"
+        <html>
+        <body>
+            <div>Thanks for your order, Golden!</div>
+            <div>Order number: 2000136-80110060</div>
+            <div>Ordered on October 9, 2025</div>
+            <a href="https://w-mt.co/g/rptrcks/comm-smart-app/services/tracking/clickTracker?redirectTo=abc123">View order</a>
+            <table automation-id="order-total">
+                <tr>
+                    <td>Subtotal</td>
+                    <td>$359.88</td>
+                </tr>
+                <tr>
+                    <td>Shipping</td>
+                    <td>$0.00</td>
+                </tr>
+                <tr>
+                    <td>Tax</td>
+                    <td>$23.65</td>
+                </tr>
+                <tr>
+                    <td><strong>Includes all fees, taxes, discounts and driver tip</strong></td>
+                    <td><strong>$383.53</strong></td>
+                </tr>
+            </table>
+        </body>
+        </html>
+        "#
+    }
+
+    #[test]
+    fn test_preorder_confirmation_email_type() {
+        let parser = WalmartEmailParser::new();
+        // Body has "thanks for your order" AND "tracking" in URLs.
+        // Must be classified as Confirmation, not Shipping.
+        let email_type = parser.detect_email_type(sample_preorder_confirmation_html());
+        assert_eq!(
+            email_type,
+            EmailType::Confirmation,
+            "Preorder confirmation should be detected as Confirmation, not Shipping"
+        );
+    }
+
+    #[test]
+    fn test_preorder_confirmation_total() {
+        let parser = WalmartEmailParser::new();
+        let total = parser.extract_total_price(sample_preorder_confirmation_html());
+        assert!(total.is_some(), "Should extract total from preorder email");
+        assert!(
+            (total.unwrap() - 383.53).abs() < 0.01,
+            "Total should be $383.53, got: {:?}",
+            total
+        );
+    }
+
+    #[test]
+    fn test_preorder_confirmation_order_id() {
+        let parser = WalmartEmailParser::new();
+        let order_id = parser.extract_order_id(sample_preorder_confirmation_html());
+        assert!(order_id.is_ok(), "Should extract order ID");
+        assert_eq!(order_id.unwrap(), "200013680110060");
     }
 }

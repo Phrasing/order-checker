@@ -104,7 +104,190 @@ impl Database {
             .await?;
         tracing::debug!("Migration 010 (indexes) completed");
 
+        // Phase 5: Normalize any non-ISO order_date values
+        self.normalize_order_dates().await?;
+
+        // Phase 6: Reconcile order statuses where cancellation events were overridden
+        self.reconcile_order_statuses().await?;
+
         tracing::info!("All database migrations completed successfully");
+        Ok(())
+    }
+
+    /// Normalize order_date values that aren't in ISO 8601 format.
+    ///
+    /// Some legacy data may have dates stored as "Jul 18, 2025" instead of
+    /// "2025-07-18T00:00:00Z". This breaks SQL `ORDER BY order_date DESC`
+    /// because "J" > "2" lexicographically.
+    async fn normalize_order_dates(&self) -> Result<()> {
+        // Find all order_date values that don't start with a year (non-ISO)
+        let bad_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, order_date FROM orders WHERE order_date NOT LIKE '20%'"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if bad_rows.is_empty() {
+            return Ok(());
+        }
+
+        tracing::info!(
+            count = bad_rows.len(),
+            "Found non-ISO order_date values, normalizing"
+        );
+
+        let date_formats = [
+            "%b %d, %Y",   // "Jul 18, 2025"
+            "%B %d, %Y",   // "July 18, 2025"
+            "%m/%d/%Y",    // "07/18/2025"
+            "%d-%b-%Y",    // "18-Jul-2025"
+        ];
+
+        for (order_id, raw_date) in &bad_rows {
+            let mut normalized = None;
+            for fmt in &date_formats {
+                if let Ok(parsed) = chrono::NaiveDate::parse_from_str(raw_date.trim(), fmt) {
+                    normalized = Some(format!("{}T00:00:00Z", parsed));
+                    break;
+                }
+            }
+
+            if let Some(iso_date) = normalized {
+                tracing::debug!(
+                    order_id = %order_id,
+                    from = %raw_date,
+                    to = %iso_date,
+                    "Normalizing order_date"
+                );
+                sqlx::query("UPDATE orders SET order_date = ? WHERE id = ?")
+                    .bind(&iso_date)
+                    .bind(order_id)
+                    .execute(&self.pool)
+                    .await?;
+            } else {
+                tracing::warn!(
+                    order_id = %order_id,
+                    date = %raw_date,
+                    "Could not parse non-ISO order_date, leaving as-is"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fix orders that show "shipped" but have a cancellation event.
+    ///
+    /// This can happen when a shipping email is processed after a cancellation
+    /// email, overriding the status. The status precedence guard in process.rs
+    /// prevents this going forward, but existing data needs reconciliation.
+    async fn reconcile_order_statuses(&self) -> Result<()> {
+        let affected: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT o.id
+            FROM orders o
+            WHERE o.status = 'shipped'
+            AND EXISTS (
+                SELECT 1 FROM email_events ee
+                WHERE ee.order_id = o.id AND ee.event_type = 'cancellation'
+            )
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if !affected.is_empty() {
+            tracing::info!(
+                count = affected.len(),
+                "Found shipped orders with cancellation events, reconciling"
+            );
+
+            for (order_id,) in &affected {
+                let (non_canceled,): (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM line_items WHERE order_id = ? AND status != 'canceled'",
+                )
+                .bind(order_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+                let new_status = if non_canceled == 0 {
+                    "canceled"
+                } else {
+                    "partially_canceled"
+                };
+
+                sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
+                    .bind(new_status)
+                    .bind(order_id)
+                    .execute(&self.pool)
+                    .await?;
+
+                tracing::info!(
+                    order_id = %order_id,
+                    from = "shipped",
+                    to = %new_status,
+                    "Reconciled order status"
+                );
+            }
+        }
+
+        // Also fix orders misclassified as "shipping" when the email subject
+        // indicates delivery (e.g., "Delivered: ..."). This happens when the
+        // HTML body lacks explicit delivery keywords but has tracking URLs.
+        let misclassified: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT ee.order_id
+            FROM email_events ee
+            WHERE ee.event_type = 'shipping'
+            AND ee.email_subject LIKE 'Delivered:%'
+            AND EXISTS (
+                SELECT 1 FROM orders o
+                WHERE o.id = ee.order_id AND o.status = 'shipped'
+            )
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (order_id,) in &misclassified {
+            sqlx::query("UPDATE orders SET status = 'delivered' WHERE id = ?")
+                .bind(order_id)
+                .execute(&self.pool)
+                .await?;
+
+            sqlx::query("UPDATE line_items SET status = 'delivered' WHERE order_id = ?")
+                .bind(order_id)
+                .execute(&self.pool)
+                .await?;
+
+            tracing::info!(
+                order_id = %order_id,
+                from = "shipped",
+                to = "delivered",
+                "Reconciled misclassified delivery"
+            );
+        }
+
+        // Phase 3: Deduplicate email_events (clean up duplicates from prior re-fetch cycles)
+        let dedup_result = sqlx::query(
+            r#"
+            DELETE FROM email_events
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM email_events
+                GROUP BY order_id, event_type, email_subject
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        if dedup_result.rows_affected() > 0 {
+            tracing::info!(
+                count = dedup_result.rows_affected(),
+                "Removed duplicate email_events"
+            );
+        }
+
         Ok(())
     }
 

@@ -39,7 +39,9 @@ fn init_logging(log_dir: PathBuf) -> tracing_appender::non_blocking::WorkerGuard
         .with_line_number(true)
         .with_writer(file_writer)
         .with_ansi(false)
-        .with_filter(tracing_subscriber::EnvFilter::new("debug"));
+        .with_filter(tracing_subscriber::EnvFilter::new(
+            "info,walmart_dashboard=debug,walmart_dashboard_tauri=debug",
+        ));
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -125,10 +127,15 @@ fn main() {
             let db = Arc::new(db);
             let tracking_service = TrackingService::new();
 
-            // Clone for background task before moving into AppState
+            // Clone for background tasks before moving into AppState
             let db_for_task = Arc::clone(&db);
             let tracking_service_for_task = tracking_service.clone();
             let app_handle = app.handle().clone();
+
+            let db_for_email_check = Arc::clone(&db);
+            let client_secret_for_check = client_secret_path.clone();
+            let db_path_for_check = db_path.clone();
+            let app_handle_for_check = app.handle().clone();
 
             app.manage(AppState {
                 db,
@@ -176,6 +183,30 @@ fn main() {
                 }
             });
 
+            // Spawn background new-email check task
+            tauri::async_runtime::spawn(async move {
+                // Wait for app to initialize (slightly after tracking task)
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+                tracing::info!("Starting background new-email check...");
+
+                let base_dir = db_path_for_check
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf();
+
+                let check = walmart_dashboard::ingestion::check_new_emails(
+                    &db_for_email_check,
+                    &client_secret_for_check,
+                    &base_dir,
+                )
+                .await;
+
+                if let Err(err) = app_handle_for_check.emit("new-emails-available", &check) {
+                    tracing::error!("Failed to emit new-emails-available event: {}", err);
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -188,6 +219,7 @@ fn main() {
             commands::restart_tracking_session,
             commands::process_emails,
             commands::sync_and_process_orders,
+            commands::check_new_emails,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")

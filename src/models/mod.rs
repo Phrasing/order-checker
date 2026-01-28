@@ -54,8 +54,7 @@ pub enum ItemStatus {
     /// Item is part of the order but hasn't shipped yet
     Ordered,
     /// Item has been shipped
-    Shipped,
-    /// Item has been delivered
+    Shipped,    /// Item has been delivered
     Delivered,
     /// Item was canceled
     Canceled,

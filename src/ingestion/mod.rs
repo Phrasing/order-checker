@@ -6,11 +6,14 @@
 
 pub mod gmail;
 
-use crate::auth::GmailClient;
+use crate::auth::{AccountAuth, GmailClient, get_gmail_client_for_account};
 use crate::db::{Database, EmailData};
+use crate::web::fetch_pending_email_count_filtered;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use gmail::{FetchedEmail, GmailFetcher, MessageRef};
@@ -450,4 +453,113 @@ async fn process_messages_with_account(
     tracing::info!("{}", stats.summary());
 
     Ok(())
+}
+
+// ============================================================================
+// Lightweight new-email check (no downloads)
+// ============================================================================
+
+/// Result of a lightweight new-email check
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewEmailCheck {
+    /// New emails on Gmail not yet in local DB
+    pub total_new: usize,
+    /// Emails in local DB not yet processed into orders
+    pub total_pending: i64,
+}
+
+/// Check for new emails across all active accounts without downloading content.
+///
+/// Lists Gmail message IDs (last 5 days) and deduplicates against the local DB.
+/// Returns counts of new (unsynced) and pending (unprocessed) emails.
+/// Fails silently per-account — auth/network errors are logged and skipped.
+pub async fn check_new_emails(
+    db: &Database,
+    client_secret_path: &Path,
+    base_dir: &Path,
+) -> NewEmailCheck {
+    let mut result = NewEmailCheck {
+        total_new: 0,
+        total_pending: 0,
+    };
+
+    let accounts = match db.list_accounts().await {
+        Ok(accs) => accs,
+        Err(err) => {
+            tracing::warn!("Failed to list accounts for new email check: {}", err);
+            return result;
+        }
+    };
+
+    for acc in &accounts {
+        if !acc.is_active {
+            continue;
+        }
+
+        // Count locally pending emails for this account
+        if let Ok(pending) = fetch_pending_email_count_filtered(db, Some(acc.id)).await {
+            result.total_pending += pending;
+        }
+
+        // Resolve token cache path
+        let token_path = PathBuf::from(&acc.token_cache_path);
+        let resolved_path = if token_path.is_absolute() {
+            token_path
+        } else {
+            base_dir.join(token_path)
+        };
+
+        let account_auth = AccountAuth::with_path(&acc.email, resolved_path);
+
+        // Try to build Gmail client (may fail if token expired / offline)
+        let gmail_client = match get_gmail_client_for_account(client_secret_path, &account_auth).await {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(email = %acc.email, error = %err, "Auth failed during new email check");
+                continue;
+            }
+        };
+
+        let fetcher = GmailFetcher::new(gmail_client);
+
+        // List Gmail IDs from last 5 days (cheap — IDs only, no content)
+        let messages = match fetcher.list_walmart_emails(Some(5)).await {
+            Ok(msgs) => msgs,
+            Err(err) => {
+                tracing::warn!(email = %acc.email, error = %err, "Failed to list Gmail messages");
+                continue;
+            }
+        };
+
+        if messages.is_empty() {
+            continue;
+        }
+
+        // Dedup against local DB
+        let all_ids: Vec<&str> = messages.iter().map(|msg| msg.id.as_str()).collect();
+        match db.get_existing_gmail_ids_for_account(acc.id, &all_ids).await {
+            Ok(existing) => {
+                let new_count = messages.len().saturating_sub(existing.len());
+                result.total_new += new_count;
+                tracing::info!(
+                    email = %acc.email,
+                    total = messages.len(),
+                    existing = existing.len(),
+                    new = new_count,
+                    "New email check complete for account"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(email = %acc.email, error = %err, "Failed to check existing gmail IDs");
+            }
+        }
+    }
+
+    tracing::info!(
+        total_new = result.total_new,
+        total_pending = result.total_pending,
+        "New email check complete"
+    );
+
+    result
 }

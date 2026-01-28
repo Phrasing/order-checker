@@ -14,7 +14,7 @@ use google_gmail1::api::Scope;
 /// Matches: order confirmations, cancellations, shipping updates, delivery/arrival
 /// Uses "from:walmart" to match both walmart.com and help@walmart.com
 const WALMART_BASE_QUERY: &str =
-    "from:walmart subject:(order OR canceled OR cancelled OR delivery OR shipped OR delayed OR confirmed OR confirmation OR arrived)";
+    "from:walmart subject:(order OR preorder OR canceled OR cancelled OR delivery OR delivered OR shipped OR delayed OR confirmed OR confirmation OR arrived)";
 
 /// Build the Walmart search query with an optional date filter
 pub fn build_walmart_query(days: Option<u32>) -> String {
@@ -22,6 +22,14 @@ pub fn build_walmart_query(days: Option<u32>) -> String {
         Some(d) if d > 0 => format!("{} newer_than:{}d", WALMART_BASE_QUERY, d),
         _ => WALMART_BASE_QUERY.to_string(),
     }
+}
+
+/// Build the Walmart search query with an absolute date filter.
+/// Uses Gmail's `after:` operator for a stable cutoff regardless of when sync runs.
+/// `since_date` format: "YYYY-MM-DD"
+pub fn build_walmart_query_since(since_date: &str) -> String {
+    let gmail_date = since_date.replace('-', "/");
+    format!("{} after:{}", WALMART_BASE_QUERY, gmail_date)
 }
 
 /// Represents a fetched email message
@@ -439,8 +447,16 @@ fn extract_html_from_mime(mime_content: &str) -> String {
         if let Some((offset, sep_len)) = blank_line_offset {
             let content_start = search_start + offset + sep_len;
 
-            // Check if content is base64 or quoted-printable
-            let header_section = &lower[html_type_pos..content_start];
+            // Check if content is base64 or quoted-printable.
+            // Search backward from Content-Type to find the start of this header block
+            // (previous blank line or start of content). This ensures we find
+            // Content-Transfer-Encoding even when it appears before Content-Type.
+            let header_block_start = lower[..html_type_pos]
+                .rfind("\n\n")
+                .map(|pos| pos + 2)
+                .or_else(|| lower[..html_type_pos].rfind("\r\n\r\n").map(|pos| pos + 4))
+                .unwrap_or(0);
+            let header_section = &lower[header_block_start..content_start];
 
             // Find the end of this MIME part using the specific boundary if available
             let content = &mime_content[content_start..];

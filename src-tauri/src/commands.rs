@@ -271,6 +271,7 @@ async fn perform_sync_and_process(
     db_path: PathBuf,
     client_secret_path: PathBuf,
     tracking_service: TrackingService,
+    fetch_since: Option<String>,
 ) -> Result<SyncResult, String> {
     let mut errors = Vec::new();
     let mut total_synced = 0usize;
@@ -323,13 +324,21 @@ async fn perform_sync_and_process(
         // Get Gmail client for this account
         match get_gmail_client_for_account(&client_secret_path, &account_auth).await {
             Ok(gmail_client) => {
-                // Sync emails from last 5 days
-                match ingestion::sync_emails_with_days_and_account(
-                    &db,
-                    gmail_client,
-                    5,
-                    acc.id,
-                ).await {
+                // Sync emails: use user-specified date or default to last 5 days
+                let sync_result = match &fetch_since {
+                    Some(since_date) => {
+                        let query = ingestion::gmail::build_walmart_query_since(since_date);
+                        ingestion::sync_emails_with_query_and_account(
+                            &db, gmail_client, &query, acc.id,
+                        ).await
+                    }
+                    None => {
+                        ingestion::sync_emails_with_days_and_account(
+                            &db, gmail_client, 5, acc.id,
+                        ).await
+                    }
+                };
+                match sync_result {
                     Ok(stats) => {
                         total_synced += stats.synced;
                         tracing::info!(
@@ -415,6 +424,7 @@ async fn perform_sync_and_process(
 #[tauri::command]
 pub async fn sync_and_process_orders(
     state: State<'_, AppState>,
+    fetch_since: Option<String>,
 ) -> Result<SyncResult, String> {
     let db = Arc::clone(&state.db);
     let db_path = state.db_path.clone();
@@ -427,9 +437,32 @@ pub async fn sync_and_process_orders(
     let handle = tokio::runtime::Handle::current();
 
     std::thread::spawn(move || {
-        let result = handle.block_on(perform_sync_and_process(db, db_path, client_secret_path, tracking_service));
+        let result = handle.block_on(perform_sync_and_process(db, db_path, client_secret_path, tracking_service, fetch_since));
         let _ = tx.send(result);
     });
 
     rx.await.map_err(|_| "Sync task failed".to_string())?
+}
+
+/// Lightweight check for new emails without downloading content
+#[tauri::command]
+pub async fn check_new_emails(
+    state: State<'_, AppState>,
+) -> Result<ingestion::NewEmailCheck, String> {
+    let db = Arc::clone(&state.db);
+    let db_path = state.db_path.clone();
+    let client_secret_path = state.client_secret_path.clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::runtime::Handle::current();
+
+    std::thread::spawn(move || {
+        let base_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+        let result = handle.block_on(async {
+            ingestion::check_new_emails(&db, &client_secret_path, &base_dir).await
+        });
+        let _ = tx.send(Ok(result));
+    });
+
+    rx.await.map_err(|_| "Email check task failed".to_string())?
 }

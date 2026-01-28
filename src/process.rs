@@ -364,13 +364,11 @@ async fn process_single_email(
         email.raw_body.clone()
     };
 
-    // Debug: Log first 200 chars to understand content
     tracing::debug!(
-        "Email {} (QP decode: {}): subject={:?}, body_start={:?}",
-        email.gmail_id,
-        needs_decode,
-        email.subject,
-        html.chars().take(200).collect::<String>()
+        gmail_id = %email.gmail_id,
+        qp_decode = needs_decode,
+        body_len = html.len(),
+        "Processing email"
     );
 
     // Detect email type from the decoded HTML
@@ -643,6 +641,15 @@ async fn apply_shipping_tx<'a>(
     insert_order_tx(tx, order).await?;
     update_order_status_tx(tx, &order.id, OrderStatus::Shipped).await?;
 
+    // Fill in total_cost if this email has one and the order doesn't yet
+    if order.total_cost.is_some() {
+        sqlx::query("UPDATE orders SET total_cost = ? WHERE id = ? AND (total_cost IS NULL OR total_cost = 0)")
+            .bind(order.total_cost)
+            .bind(&order.id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
     // Record the shipped date from the email's gmail_date
     if let Some(ref gmail_date) = email.gmail_date {
         update_shipped_date_tx(tx, &order.id, gmail_date).await?;
@@ -680,6 +687,15 @@ async fn apply_delivery_tx<'a>(
 ) -> Result<()> {
     insert_order_tx(tx, order).await?;
     update_order_status_tx(tx, &order.id, OrderStatus::Delivered).await?;
+
+    // Fill in total_cost if this email has one and the order doesn't yet
+    if order.total_cost.is_some() {
+        sqlx::query("UPDATE orders SET total_cost = ? WHERE id = ? AND (total_cost IS NULL OR total_cost = 0)")
+            .bind(order.total_cost)
+            .bind(&order.id)
+            .execute(&mut **tx)
+            .await?;
+    }
 
     if !order.items.is_empty() {
         let item_names: Vec<&str> = order.items.iter().map(|i| i.name.as_str()).collect();
@@ -1021,11 +1037,40 @@ async fn update_order_from_confirmation_tx<'a>(
     Ok(())
 }
 
+/// Check whether a status transition is valid.
+/// Terminal states (Canceled) cannot be overridden.
+/// Delivered can only be overridden by Canceled.
+fn is_valid_status_transition(current: &str, new: &str) -> bool {
+    match current {
+        "canceled" => false,
+        "delivered" => new == "canceled",
+        _ => true,
+    }
+}
+
 async fn update_order_status_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     order_id: &str,
     status: OrderStatus,
 ) -> Result<()> {
+    let current: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM orders WHERE id = ?")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+
+    if let Some((current_status,)) = current {
+        if !is_valid_status_transition(&current_status, status.as_str()) {
+            tracing::warn!(
+                "Blocked status transition for order {}: {} → {}",
+                order_id,
+                current_status,
+                status.as_str()
+            );
+            return Ok(());
+        }
+    }
+
     sqlx::query("UPDATE orders SET status = ? WHERE id = ?")
         .bind(status.as_str())
         .bind(order_id)

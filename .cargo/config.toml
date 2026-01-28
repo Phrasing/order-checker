@@ -1,0 +1,7 @@
+[profile.dev]
+# Reduce debug info to avoid Windows PDB size limit (LNK1140)
+debug = 1  # Line tables only, not full debug info
+
+[profile.dev.package."*"]
+# Even less debug info for dependencies
+debug = 0

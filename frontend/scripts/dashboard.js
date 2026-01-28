@@ -12,6 +12,8 @@ let currentSort = 'date'; // 'date' or 'status'
 let currentAccountId = null; // null = all accounts
 let currentDatePreset = '0'; // '7', '30', '90', or '0' (all)
 let currentSearchQuery = '';
+let newEmailCount = 0;
+let fetchSinceDate = localStorage.getItem('fetchSinceDate') || null;
 let isSyncing = false;
 
 // Status priority for sorting (lower = higher priority)
@@ -23,11 +25,9 @@ const statusPriority = {
     'canceled': 5
 };
 
-// Display shipped_date for shipped/delivered orders, order_date otherwise
+// Display the order's effective date (backend provides the correct date:
+// shipped_date for shipped/delivered orders, order_date otherwise)
 function displayDate(order) {
-    if ((order.status === 'shipped' || order.status === 'delivered') && order.shipped_date) {
-        return order.shipped_date;
-    }
     return order.order_date;
 }
 
@@ -152,7 +152,7 @@ function renderStats(orders) {
     // Count orders this week (excluding canceled)
     const oneWeekAgo = new Date();
     oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-    const thisWeek = activeOrders.filter(o => new Date(o.order_date) >= oneWeekAgo).length;
+    const thisWeek = activeOrders.filter(o => new Date(o.order_date_raw) >= oneWeekAgo).length;
 
     // Update UI
     document.getElementById('stat-total-spent').textContent = '$' + totalSpent.toFixed(2);
@@ -223,6 +223,27 @@ window.handleAccountChange = async function(value) {
 };
 
 /**
+ * Update badge on Sync button showing count of new/pending emails
+ */
+function updateSyncBadge() {
+    const btn = document.getElementById('sync-btn');
+    let badge = document.getElementById('sync-badge');
+
+    if (newEmailCount > 0) {
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.id = 'sync-badge';
+            badge.className = 'sync-badge';
+            btn.appendChild(badge);
+        }
+        badge.textContent = newEmailCount > 99 ? '99+' : newEmailCount;
+        badge.style.display = 'inline-flex';
+    } else if (badge) {
+        badge.style.display = 'none';
+    }
+}
+
+/**
  * Sync orders from Gmail and process them
  */
 window.syncOrders = async function() {
@@ -235,7 +256,9 @@ window.syncOrders = async function() {
 
     try {
         console.log('Starting sync...');
-        const result = await invoke('sync_and_process_orders');
+        const args = {};
+        if (fetchSinceDate) args.fetchSince = fetchSinceDate;
+        const result = await invoke('sync_and_process_orders', args);
         console.log('Sync complete:', result);
 
         // Show result message
@@ -255,6 +278,8 @@ window.syncOrders = async function() {
         isSyncing = false;
         btn.classList.remove('loading');
         btn.disabled = false;
+        newEmailCount = 0;
+        updateSyncBadge();
     }
 };
 
@@ -307,7 +332,8 @@ function sortOrders(orders, sortBy) {
             if (priorityA !== priorityB) return priorityA - priorityB;
         }
         // Secondary/primary sort by date (newest first)
-        return new Date(b.order_date) - new Date(a.order_date);
+        // Use raw ISO date for reliable comparison (order_date is formatted for display)
+        return new Date(b.order_date_raw) - new Date(a.order_date_raw);
     });
 }
 
@@ -730,6 +756,59 @@ function setupDatePresetListeners() {
 }
 
 /**
+ * Set up the "Fetch Since" date picker with localStorage persistence.
+ * Controls the Gmail sync range (not the display filter).
+ */
+function setupFetchSincePicker() {
+    const input = document.getElementById('fetch-since-date');
+    const hint = document.getElementById('fetch-since-hint');
+    if (!input || !hint) return;
+
+    // Restore saved value
+    if (fetchSinceDate) {
+        input.value = fetchSinceDate;
+        updateFetchSinceHint(hint, fetchSinceDate);
+    }
+
+    // Can't fetch future emails
+    input.max = new Date().toISOString().split('T')[0];
+
+    input.addEventListener('change', () => {
+        const val = input.value; // "YYYY-MM-DD" or ""
+        if (val) {
+            fetchSinceDate = val;
+            localStorage.setItem('fetchSinceDate', val);
+        } else {
+            fetchSinceDate = null;
+            localStorage.removeItem('fetchSinceDate');
+        }
+        updateFetchSinceHint(hint, fetchSinceDate);
+    });
+}
+
+function updateFetchSinceHint(hint, dateStr) {
+    if (!dateStr) {
+        hint.textContent = 'Default: last 5 days';
+        hint.className = 'fetch-since-hint';
+        return;
+    }
+    const selected = new Date(dateStr + 'T00:00:00');
+    const now = new Date();
+    const diffDays = Math.round((now - selected) / (1000 * 60 * 60 * 24));
+
+    if (diffDays > 365) {
+        hint.textContent = `${diffDays} days ago \u2014 this may take a while`;
+        hint.className = 'fetch-since-hint fetch-since-warn';
+    } else if (diffDays > 90) {
+        hint.textContent = `${diffDays} days ago \u2014 larger sync`;
+        hint.className = 'fetch-since-hint fetch-since-warn';
+    } else {
+        hint.textContent = `${diffDays} days of emails`;
+        hint.className = 'fetch-since-hint';
+    }
+}
+
+/**
  * Escape HTML to prevent XSS
  */
 function escapeHtml(text) {
@@ -743,12 +822,21 @@ function escapeHtml(text) {
 document.addEventListener('DOMContentLoaded', () => {
     setupFilterListeners();
     setupDatePresetListeners();
+    setupFetchSincePicker();
     loadDashboard();
 
     // Listen for tracking sync complete event from backend
     listen('tracking-sync-complete', () => {
         console.log('Tracking sync complete, refreshing dashboard...');
         loadDashboard();
+    });
+
+    // Listen for new-email check result from background startup task
+    listen('new-emails-available', (event) => {
+        const check = event.payload;
+        console.log('New email check:', check);
+        newEmailCount = (check.total_new || 0) + (check.total_pending || 0);
+        updateSyncBadge();
     });
 });
 
