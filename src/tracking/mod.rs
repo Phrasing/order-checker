@@ -613,7 +613,13 @@ async fn update_tracking_cache(
 
         let tracking_state = latest_event
             .map(|e| TrackingState::from_track17(&e.tracking_state()))
-            .unwrap_or(TrackingState::Unknown);
+            .unwrap_or_else(|| {
+                if shipment.shipment.is_some() {
+                    TrackingState::LabelCreated
+                } else {
+                    TrackingState::Unknown
+                }
+            });
 
         let state_desc = latest_event
             .and_then(|e| e.description.clone());

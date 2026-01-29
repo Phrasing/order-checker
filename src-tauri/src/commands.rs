@@ -3,9 +3,12 @@
 //! These commands are called from the frontend JavaScript via tauri.invoke()
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::State;
+use base64::Engine;
+use sqlx::Row;
 use walmart_dashboard::auth::{AccountAuth, get_gmail_client_for_account, fetch_profile_picture_url};
 use walmart_dashboard::db::Database;
 use walmart_dashboard::ingestion;
@@ -93,6 +96,12 @@ pub struct TrackingEventResponse {
     pub location: Option<String>,
 }
 
+/// Cached image response for frontend lazy-loading
+#[derive(Serialize)]
+pub struct CachedImageResponse {
+    pub data_url: String,
+}
+
 /// Get cached tracking status for an order
 #[tauri::command]
 pub async fn get_tracking_status(
@@ -156,7 +165,7 @@ pub async fn fetch_tracking(
             // Use recovery method for resilience against session issues
             let result = state
                 .tracking_service
-                .get_tracking_status_with_recovery(&state.db, &tracking_number, &carrier, true)
+                .get_tracking_status(&state.db, &tracking_number, &carrier, true)
                 .await
                 .map_err(|e| {
                     tracing::error!(
@@ -426,6 +435,7 @@ pub async fn sync_and_process_orders(
     state: State<'_, AppState>,
     fetch_since: Option<String>,
 ) -> Result<SyncResult, String> {
+    tracing::info!("Sync command invoked");
     let db = Arc::clone(&state.db);
     let db_path = state.db_path.clone();
     let client_secret_path = state.client_secret_path.clone();
@@ -434,34 +444,124 @@ pub async fn sync_and_process_orders(
     // Run sync in a dedicated thread to avoid HRTB Send issues with the
     // tauri command macro (library futures contain non-Send-for-all-lifetimes types)
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::runtime::Handle::current();
-
     std::thread::spawn(move || {
-        let result = handle.block_on(perform_sync_and_process(db, db_path, client_secret_path, tracking_service, fetch_since));
+        let result = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(perform_sync_and_process(
+                db,
+                db_path,
+                client_secret_path,
+                tracking_service,
+                fetch_since,
+            )),
+            Err(e) => Err(format!("Failed to create sync runtime: {}", e)),
+        };
         let _ = tx.send(result);
     });
 
     rx.await.map_err(|_| "Sync task failed".to_string())?
 }
 
-/// Lightweight check for new emails without downloading content
+/// Fetch cached product image as a data URL (base64) for lazy-loading in the UI
+#[tauri::command]
+pub async fn get_cached_image(
+    state: State<'_, AppState>,
+    image_id: String,
+) -> Result<Option<CachedImageResponse>, String> {
+    let row = sqlx::query(
+        "SELECT image_bytes, content_type FROM images WHERE id = ?",
+    )
+    .bind(&image_id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let row = match row {
+        Some(row) => row,
+        None => return Ok(None),
+    };
+
+    let bytes: Vec<u8> = row.try_get("image_bytes").map_err(|e| e.to_string())?;
+    let content_type: Option<String> = row.try_get("content_type").map_err(|e| e.to_string())?;
+    let content_type = content_type.unwrap_or_else(|| "image/png".to_string());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let data_url = format!("data:{};base64,{}", content_type, encoded);
+
+    Ok(Some(CachedImageResponse { data_url }))
+}
+
+/// Fetch cached thumbnails as data URLs for a batch of image IDs.
+#[tauri::command]
+pub async fn get_cached_thumbnails(
+    state: State<'_, AppState>,
+    image_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    if image_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    const CHUNK_SIZE: usize = 400;
+    let mut results: HashMap<String, String> = HashMap::new();
+
+    for chunk in image_ids.chunks(CHUNK_SIZE) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT image_id, thumb_bytes, content_type FROM image_thumbnails WHERE image_id IN ({})",
+            placeholders.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for id in chunk {
+            query = query.bind(id);
+        }
+        let rows = query
+            .fetch_all(state.db.pool())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        for row in rows {
+            let image_id: String = row.try_get("image_id").map_err(|e| e.to_string())?;
+            let bytes: Vec<u8> = row.try_get("thumb_bytes").map_err(|e| e.to_string())?;
+            let content_type: Option<String> =
+                row.try_get("content_type").map_err(|e| e.to_string())?;
+            let content_type = content_type.unwrap_or_else(|| "image/png".to_string());
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let data_url = format!("data:{};base64,{}", content_type, encoded);
+            results.insert(image_id, data_url);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Lightweight check for new emails without downloading content.
+/// When `fetch_since` is provided (e.g. "2025-01-02"), checks the same date range as sync.
 #[tauri::command]
 pub async fn check_new_emails(
     state: State<'_, AppState>,
+    fetch_since: Option<String>,
 ) -> Result<ingestion::NewEmailCheck, String> {
     let db = Arc::clone(&state.db);
     let db_path = state.db_path.clone();
     let client_secret_path = state.client_secret_path.clone();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::runtime::Handle::current();
 
     std::thread::spawn(move || {
-        let base_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-        let result = handle.block_on(async {
-            ingestion::check_new_emails(&db, &client_secret_path, &base_dir).await
-        });
-        let _ = tx.send(Ok(result));
+        let base_dir = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        let result = match tokio::runtime::Runtime::new() {
+            Ok(rt) => Ok(rt.block_on(async {
+                ingestion::check_new_emails(
+                    &db,
+                    &client_secret_path,
+                    &base_dir,
+                    fetch_since.as_deref(),
+                ).await
+            })),
+            Err(e) => Err(format!("Failed to create email check runtime: {}", e)),
+        };
+        let _ = tx.send(result);
     });
 
     rx.await.map_err(|_| "Email check task failed".to_string())?

@@ -1,13 +1,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use sqlx::Row;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use tracing_appender::rolling;
 
 use walmart_dashboard::{
     auth::{self, AccountAuth},
     db::Database,
-    ingestion, process, tracking, web,
+    images, ingestion, process, tracking,
 };
 
 /// Walmart Order Dashboard - Track and reconcile orders from email
@@ -55,13 +58,6 @@ enum Commands {
         reset: bool,
     },
 
-    /// Start the web dashboard server
-    Serve {
-        /// Port to run the web server on
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
-    },
-
     /// Show sync status and database statistics
     Status,
 
@@ -86,6 +82,20 @@ enum Commands {
 
     /// Clear all orders and line items from the database (for reprocessing)
     ClearOrders,
+
+    /// Backfill missing image thumbnails from cached images
+    BackfillThumbnails {
+        /// Rebuild all thumbnails from cached images
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Backfill missing product images via rembg (and rebuild thumbnails)
+    BackfillImages {
+        /// Rebuild all cached images and thumbnails
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Search emails by subject pattern
     SearchEmails {
@@ -359,15 +369,6 @@ async fn main() -> Result<()> {
             println!("\n{}", order_status);
         }
 
-        Commands::Serve { port } => {
-            // Initialize database
-            let db = Database::from_file(&db_path).await?;
-            db.run_migrations().await?;
-
-            println!("Starting web dashboard at http://localhost:{}", port);
-            web::serve(db, port).await?;
-        }
-
         Commands::DebugEmail { id, event_type: filter_type } => {
             let db = Database::from_file(&db_path).await?;
             db.run_migrations().await?;
@@ -489,6 +490,100 @@ async fn main() -> Result<()> {
             println!("Cleared {} orders and {} line items", orders_result.rows_affected(), items_result.rows_affected());
             println!("Reset {} processed emails to pending", processed_reset.rows_affected());
             println!("Run 'process' to reprocess emails with updated parsing logic");
+        }
+
+        Commands::BackfillThumbnails { force } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            if force {
+                let result = sqlx::query("DELETE FROM image_thumbnails")
+                    .execute(db.pool())
+                    .await?;
+                println!("Cleared {} thumbnails", result.rows_affected());
+            }
+
+            let processor = images::ImageProcessor::new(
+                db.pool().clone(),
+                Arc::new(images::NoopRemover),
+            )
+            .await?;
+
+            let created = processor.process_missing_thumbnails().await?;
+            println!("Backfilled {} thumbnails", created);
+        }
+
+        Commands::BackfillImages { force } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            if force {
+                let thumbs = sqlx::query("DELETE FROM image_thumbnails")
+                    .execute(db.pool())
+                    .await?;
+                let images = sqlx::query("DELETE FROM images")
+                    .execute(db.pool())
+                    .await?;
+                println!(
+                    "Cleared {} images and {} thumbnails",
+                    images.rows_affected(),
+                    thumbs.rows_affected()
+                );
+            }
+
+            let rows: Vec<(String,)> = sqlx::query_as(
+                "SELECT DISTINCT image_url FROM line_items WHERE image_url IS NOT NULL AND image_url != ''",
+            )
+            .fetch_all(db.pool())
+            .await?;
+
+            if rows.is_empty() {
+                println!("No product image URLs found in line_items");
+                return Ok(());
+            }
+
+            let mut url_ids: Vec<(String, String)> = Vec::with_capacity(rows.len());
+            for (url,) in rows {
+                let id = images::image_id_for_url(&url);
+                url_ids.push((url, id));
+            }
+
+            let mut existing: HashSet<String> = HashSet::new();
+            let ids: Vec<String> = url_ids.iter().map(|(_, id)| id.clone()).collect();
+            const CHUNK_SIZE: usize = 500;
+            for chunk in ids.chunks(CHUNK_SIZE) {
+                let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+                let sql = format!(
+                    "SELECT id FROM images WHERE id IN ({})",
+                    placeholders.join(", ")
+                );
+                let mut query = sqlx::query(&sql);
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                let rows = query.fetch_all(db.pool()).await?;
+                for row in rows {
+                    let id: String = row.get("id");
+                    existing.insert(id);
+                }
+            }
+
+            let missing: Vec<String> = url_ids
+                .into_iter()
+                .filter_map(|(url, id)| if existing.contains(&id) { None } else { Some(url) })
+                .collect();
+
+            let processor = images::ImageProcessor::new_rembg_http_default(db.pool().clone()).await?;
+
+            if missing.is_empty() {
+                println!("No missing images. Checking thumbnails...");
+            } else {
+                println!("Processing {} product images via rembg server", missing.len());
+                let _ = processor.process_batch(missing).await?;
+            }
+
+            let created = processor.process_missing_thumbnails().await?;
+            println!("Backfilled {} thumbnails", created);
         }
 
         Commands::SearchEmails { pattern } => {

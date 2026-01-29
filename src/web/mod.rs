@@ -1,26 +1,13 @@
 //! Web dashboard module
 //!
 //! Provides view models and data-fetching functions for the dashboard.
-//! Used by both the Axum web server and the Tauri desktop application.
+//! Used by the Tauri desktop application.
 
 use crate::db::Database;
+use crate::images::image_id_for_url;
 use anyhow::Result;
-use askama::Template;
-use axum::{
-    extract::State,
-    response::Html,
-    routing::get,
-    Router,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::net::TcpListener;
-
-/// Application state shared across handlers
-pub struct AppState {
-    pub db: Database,
-}
 
 /// View model for an order in the dashboard
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +22,9 @@ pub struct OrderViewModel {
     pub items: Vec<ItemViewModel>,
     pub tracking_number: Option<String>,
     pub carrier: Option<String>,
+    pub recipient: Option<String>,
+    pub thumbnail_id: Option<String>,
+    pub thumbnail_url: Option<String>,
 }
 
 /// View model for a line item
@@ -43,6 +33,8 @@ pub struct ItemViewModel {
     pub name: String,
     pub quantity: u32,
     pub status: String,
+    pub image_id: Option<String>,
+    pub image_url: Option<String>,
 }
 
 /// Status counts for the summary cards
@@ -78,62 +70,6 @@ pub struct DashboardData {
     pub accounts: Vec<AccountViewModel>,
     /// Currently selected account ID (None = all accounts)
     pub selected_account_id: Option<i64>,
-}
-
-/// Dashboard template
-#[derive(Template)]
-#[template(path = "dashboard.html")]
-pub struct DashboardTemplate {
-    pub orders: Vec<OrderViewModel>,
-    pub total_orders: i64,
-    pub pending_emails: i64,
-    pub status_counts: StatusCounts,
-    pub last_updated: String,
-}
-
-/// Start the web server
-pub async fn serve(db: Database, port: u16) -> Result<()> {
-    let state = Arc::new(AppState { db });
-
-    let app = Router::new()
-        .route("/", get(dashboard_handler))
-        .with_state(state);
-
-    let addr = format!("0.0.0.0:{}", port);
-    tracing::info!("Starting web server at http://localhost:{}", port);
-
-    let listener = TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
-}
-
-/// Dashboard handler - renders the main order view
-async fn dashboard_handler(
-    State(state): State<Arc<AppState>>,
-) -> Html<String> {
-    match build_dashboard(&state.db).await {
-        Ok(template) => Html(template.render().unwrap_or_else(|e| {
-            format!("<html><body><h1>Template error: {}</h1></body></html>", e)
-        })),
-        Err(e) => Html(format!(
-            "<html><body><h1>Error loading dashboard</h1><p>{}</p></body></html>",
-            e
-        )),
-    }
-}
-
-/// Build the dashboard data from the database (for Askama template)
-async fn build_dashboard(db: &Database) -> Result<DashboardTemplate> {
-    let data = get_dashboard_data(db).await?;
-
-    Ok(DashboardTemplate {
-        orders: data.orders,
-        total_orders: data.total_orders,
-        pending_emails: data.pending_emails,
-        status_counts: data.status_counts,
-        last_updated: data.last_updated,
-    })
 }
 
 /// Get dashboard data - public API for Tauri and other consumers
@@ -192,11 +128,11 @@ async fn fetch_items_for_orders(db: &Database, order_ids: &[&str]) -> Result<Has
     // Build a single query with IN clause
     let placeholders: String = order_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
-        "SELECT order_id, name, quantity, status FROM line_items WHERE order_id IN ({})",
+        "SELECT order_id, name, quantity, status, image_url FROM line_items WHERE order_id IN ({})",
         placeholders
     );
 
-    let mut q = sqlx::query_as::<_, (String, String, i32, String)>(&query);
+    let mut q = sqlx::query_as::<_, (String, String, i32, String, Option<String>)>(&query);
     for id in order_ids {
         q = q.bind(*id);
     }
@@ -204,11 +140,15 @@ async fn fetch_items_for_orders(db: &Database, order_ids: &[&str]) -> Result<Has
     let item_rows = q.fetch_all(db.pool()).await?;
 
     let mut items_by_order: HashMap<String, Vec<ItemViewModel>> = HashMap::with_capacity(order_ids.len());
-    for (order_id, name, quantity, status) in item_rows {
+    for (order_id, name, quantity, status, image_url) in item_rows {
+        let image_id = image_url.as_ref().map(|url| image_id_for_url(url));
+
         items_by_order.entry(order_id).or_default().push(ItemViewModel {
             name,
             quantity: quantity as u32,
             status,
+            image_id,
+            image_url,
         });
     }
 
@@ -217,13 +157,23 @@ async fn fetch_items_for_orders(db: &Database, order_ids: &[&str]) -> Result<Has
 
 /// Build OrderViewModels from raw order rows + pre-fetched items map
 fn build_order_view_models(
-    order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)>,
+    order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>, Option<String>)>,
     mut items_by_order: HashMap<String, Vec<ItemViewModel>>,
 ) -> Vec<OrderViewModel> {
     let mut orders = Vec::with_capacity(order_rows.len());
 
-    for (id, order_date, shipped_date, total_cost, status, tracking_number, carrier) in order_rows {
+    for (id, order_date, shipped_date, total_cost, status, tracking_number, carrier, recipient) in order_rows {
         let items = items_by_order.remove(&id).unwrap_or_default();
+        let (thumbnail_id, thumbnail_url) = items
+            .iter()
+            .find_map(|item| {
+                if item.image_id.is_some() || item.image_url.is_some() {
+                    Some((item.image_id.clone(), item.image_url.clone()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((None, None));
 
         // Use the "effective date" — same logic as displayDate() in JS and the SQL queries:
         // shipped_date for shipped/delivered orders, order_date otherwise.
@@ -247,6 +197,9 @@ fn build_order_view_models(
             items,
             tracking_number,
             carrier,
+            recipient,
+            thumbnail_id,
+            thumbnail_url,
         });
     }
 
@@ -255,9 +208,9 @@ fn build_order_view_models(
 
 /// Fetch all orders with their line items (2 queries instead of N+1)
 pub async fn fetch_orders_with_items(db: &Database) -> Result<Vec<OrderViewModel>> {
-    let order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)> = sqlx::query_as(
+    let order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier
+        SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier, recipient
         FROM orders
         ORDER BY COALESCE(CASE WHEN status IN ('shipped','delivered') THEN shipped_date END, order_date) DESC
         "#
@@ -393,12 +346,12 @@ pub async fn fetch_orders_with_items_and_dates(
     };
 
     let sql = format!(
-        "SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier \
+        "SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier, recipient \
          FROM orders {} ORDER BY {} DESC",
         where_clause, EFF_DATE
     );
 
-    let mut query = sqlx::query_as::<_, (String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>)>(&sql);
+    let mut query = sqlx::query_as::<_, (String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>, Option<String>)>(&sql);
 
     if let Some(acc_id) = account_id {
         query = query.bind(acc_id);
@@ -412,7 +365,7 @@ pub async fn fetch_orders_with_items_and_dates(
 
     let order_rows = query.fetch_all(db.pool()).await?;
 
-    tracing::debug!("Query returned {} orders", order_rows.len());
+    tracing::info!("Dashboard query returned {} orders", order_rows.len());
 
     let order_ids: Vec<&str> = order_rows.iter().map(|(id, ..)| id.as_str()).collect();
     let items_by_order = fetch_items_for_orders(db, &order_ids).await?;

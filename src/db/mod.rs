@@ -4,10 +4,13 @@
 //! for orders, line items, email events, and accounts.
 
 use anyhow::Result;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
 use std::path::Path;
+use std::str::FromStr;
 
 /// Database connection pool wrapper
 pub struct Database {
@@ -15,11 +18,16 @@ pub struct Database {
 }
 
 impl Database {
-    /// Create a new database connection pool
+    /// Create a new database connection pool with WAL mode and busy timeout
     pub async fn new(database_url: &str) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(database_url)?
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .pragma("foreign_keys", "ON");
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(options)
             .await?;
 
         Ok(Self { pool })
@@ -32,13 +40,35 @@ impl Database {
 
     /// Create a file-based database
     pub async fn from_file(path: &Path) -> Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        Self::new(&url).await
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .pragma("foreign_keys", "ON");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        Ok(Self { pool })
     }
 
     /// Get a reference to the connection pool
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Execute a SQL string that may contain multiple statements.
+    ///
+    /// `sqlx::raw_sql(sql).execute(pool)` only runs the **first** statement.
+    /// This method uses `.execute_many()` and drains the returned stream so
+    /// that every statement in the SQL text is executed.
+    async fn execute_sql(&self, sql: &str) -> Result<()> {
+        let mut stream = sqlx::raw_sql(sql).execute_many(&self.pool);
+        while let Some(_result) = stream.try_next().await? {}
+        Ok(())
     }
 
     /// Run migrations to set up the database schema
@@ -51,12 +81,12 @@ impl Database {
             include_str!("../../migrations/004_tracking_cache.sql"),
             include_str!("../../migrations/005_accounts.sql"),
             include_str!("../../migrations/006_fix_line_items_duplicates.sql"),
+            include_str!("../../migrations/012_images.sql"),
+            include_str!("../../migrations/013_image_thumbnails.sql"),
         ];
 
         for (i, migration_sql) in schema_migrations.iter().enumerate() {
-            sqlx::raw_sql(migration_sql)
-                .execute(&self.pool)
-                .await?;
+            self.execute_sql(migration_sql).await?;
             tracing::debug!("Migration {} completed", i + 1);
         }
 
@@ -70,6 +100,8 @@ impl Database {
             "ALTER TABLE raw_emails ADD COLUMN account_id INTEGER REFERENCES accounts(id)",
             "ALTER TABLE orders ADD COLUMN shipped_date TEXT",
             "ALTER TABLE accounts ADD COLUMN profile_picture_url TEXT",
+            "ALTER TABLE raw_emails ADD COLUMN recipient TEXT",
+            "ALTER TABLE orders ADD COLUMN recipient TEXT",
         ];
         for sql in optional_columns {
             match sqlx::query(sql).execute(&self.pool).await {
@@ -92,22 +124,47 @@ impl Database {
         ];
 
         for (name, migration_sql) in data_migrations {
-            sqlx::raw_sql(migration_sql)
-                .execute(&self.pool)
-                .await?;
+            self.execute_sql(migration_sql).await?;
             tracing::debug!("Migration {} completed", name);
         }
 
         // Phase 4: Indexes that depend on optional columns
-        sqlx::raw_sql(include_str!("../../migrations/010_indexes.sql"))
-            .execute(&self.pool)
-            .await?;
+        self.execute_sql(include_str!("../../migrations/010_indexes.sql")).await?;
         tracing::debug!("Migration 010 (indexes) completed");
 
-        // Phase 5: Normalize any non-ISO order_date values
+        // Phase 5: One-time data reset to allow clean re-sync after fixing the
+        // fetch_email_full base64 double-decode bug (empty bodies).
+        let sentinel_exists: bool = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_reset_017')"
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(false);
+
+        if !sentinel_exists {
+            sqlx::query("DELETE FROM email_events").execute(&self.pool).await?;
+            sqlx::query("DELETE FROM line_items").execute(&self.pool).await?;
+            sqlx::query("DELETE FROM orders").execute(&self.pool).await?;
+            sqlx::query("DELETE FROM tracking_cache").execute(&self.pool).await?;
+            sqlx::query("DELETE FROM tracking_events").execute(&self.pool).await?;
+            sqlx::query("DELETE FROM raw_emails").execute(&self.pool).await?;
+            sqlx::raw_sql("DROP TABLE IF EXISTS _reset_014").execute(&self.pool).await?;
+            sqlx::raw_sql("DROP TABLE IF EXISTS _reset_015").execute(&self.pool).await?;
+            sqlx::raw_sql("DROP TABLE IF EXISTS _reset_016").execute(&self.pool).await?;
+            sqlx::raw_sql("DROP TABLE IF EXISTS line_items_new").execute(&self.pool).await?;
+            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS _reset_017 (done INTEGER PRIMARY KEY DEFAULT 1)")
+                .execute(&self.pool).await?;
+            tracing::info!("One-time data reset completed (017) — re-sync required");
+        }
+
+        // Phase 6: Fix order dates from email timestamps (idempotent)
+        self.execute_sql(include_str!("../../migrations/014_fix_order_dates.sql")).await?;
+        tracing::debug!("Migration 014 (fix order dates) completed");
+
+        // Phase 7: Normalize any non-ISO order_date values
         self.normalize_order_dates().await?;
 
-        // Phase 6: Reconcile order statuses where cancellation events were overridden
+        // Phase 8: Reconcile order statuses where cancellation events were overridden
         self.reconcile_order_statuses().await?;
 
         tracing::info!("All database migrations completed successfully");
@@ -318,7 +375,7 @@ impl Database {
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let query = format!(
-                "SELECT gmail_id FROM raw_emails WHERE gmail_id IN ({})",
+                "SELECT gmail_id FROM raw_emails WHERE gmail_id IN ({}) AND processing_status != 'pending'",
                 placeholders.join(", ")
             );
 
@@ -345,14 +402,15 @@ impl Database {
         subject: Option<&str>,
         snippet: Option<&str>,
         sender: Option<&str>,
+        recipient: Option<&str>,
         raw_body: &str,
         event_type: &str,
         gmail_date: Option<&str>,
     ) -> Result<i64> {
         let result = sqlx::query(
             r#"
-            INSERT INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, raw_body, event_type, gmail_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
         .bind(gmail_id)
@@ -360,6 +418,7 @@ impl Database {
         .bind(subject)
         .bind(snippet)
         .bind(sender)
+        .bind(recipient)
         .bind(raw_body)
         .bind(event_type)
         .bind(gmail_date)
@@ -370,7 +429,6 @@ impl Database {
     }
 
     /// Batch insert raw emails using a transaction
-    /// Uses INSERT OR IGNORE to handle duplicates gracefully
     pub async fn insert_raw_emails_batch(&self, emails: &[EmailData]) -> Result<usize> {
         if emails.is_empty() {
             return Ok(0);
@@ -381,16 +439,15 @@ impl Database {
 
         for email in emails {
             let result = sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, raw_body, event_type, gmail_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#
+                "INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&email.gmail_id)
             .bind(&email.thread_id)
             .bind(&email.subject)
             .bind(&email.snippet)
             .bind(&email.sender)
+            .bind(&email.recipient)
             .bind(&email.raw_body)
             .bind(&email.event_type)
             .bind(&email.gmail_date)
@@ -627,7 +684,7 @@ impl Database {
         for chunk in ids.chunks(CHUNK_SIZE) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let query = format!(
-                "SELECT gmail_id FROM raw_emails WHERE account_id = ? AND gmail_id IN ({})",
+                "SELECT gmail_id FROM raw_emails WHERE (account_id = ? OR account_id IS NULL) AND gmail_id IN ({}) AND processing_status != 'pending'",
                 placeholders.join(", ")
             );
 
@@ -662,16 +719,15 @@ impl Database {
 
         for email in emails {
             let result = sqlx::query(
-                r#"
-                INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, raw_body, event_type, gmail_date, account_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
+                "INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date, account_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&email.gmail_id)
             .bind(&email.thread_id)
             .bind(&email.subject)
             .bind(&email.snippet)
             .bind(&email.sender)
+            .bind(&email.recipient)
             .bind(&email.raw_body)
             .bind(&email.event_type)
             .bind(&email.gmail_date)
@@ -705,6 +761,7 @@ pub struct EmailData {
     pub subject: Option<String>,
     pub snippet: Option<String>,
     pub sender: Option<String>,
+    pub recipient: Option<String>,
     pub raw_body: String,
     pub event_type: String,
     pub gmail_date: Option<String>,

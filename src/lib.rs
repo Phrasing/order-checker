@@ -24,6 +24,7 @@
 pub mod auth;
 pub mod db;
 pub mod ingestion;
+pub mod images;
 pub mod models;
 pub mod parsing;
 pub mod process;

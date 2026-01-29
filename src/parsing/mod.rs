@@ -16,6 +16,7 @@ use crate::models::{ItemStatus, LineItem, OrderStatus, WalmartOrder};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use thiserror::Error;
 
@@ -33,6 +34,101 @@ fn nested_span_order_id_pattern() -> &'static Regex {
             r"(?i)order\s*(?:number|#|num\.?)?[:\s]*<a[^>]*>\s*<span[^>]*>([0-9\-]{10,})</span>"
         ).expect("Invalid nested span regex")
     })
+}
+
+fn order_id_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)order\s*(?:number|#|num\.?)?[:\s]*(?:<[^>]*>)*\s*([0-9-]{10,})")
+            .expect("Invalid order ID regex")
+    })
+}
+
+fn price_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"\$\s*([0-9,]+\.?\d*)").expect("Invalid price regex"))
+}
+
+fn product_class_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)productName[a-zA-Z0-9_-]*").expect("Invalid product class regex")
+    })
+}
+
+fn price_class_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)priceStyling[a-zA-Z0-9_-]*").expect("Invalid price class regex")
+    })
+}
+
+fn date_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:ordered\s+on|order\s+date|placed\s+on)[:\s]*(?:\w+,\s+)?(\w+\s+\d{1,2},?\s+\d{4})"
+        )
+        .expect("Invalid date regex")
+    })
+}
+
+fn alt_item_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"alt\s*=\s*["']quantity\s+(\d+)\s+item\s+([^"']+)["']"#)
+            .expect("Invalid alt item regex")
+    })
+}
+
+fn alt_item_text_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?i)^\s*quantity\s+(\d+)\s+item\s+(.+?)\s*$"#)
+            .expect("Invalid alt item text regex")
+    })
+}
+
+fn item_name_class_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)itemName[a-zA-Z0-9_-]*").expect("Invalid item name class regex")
+    })
+}
+
+fn tracking_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r"(?i)(fedex|ups|usps|ontrac)\s+tracking\s+number\s*(?:<a[^>]*>)?([A-Z0-9]{10,30})(?:</a>)?"
+        )
+        .expect("Invalid tracking regex")
+    })
+}
+
+fn order_total_selector() -> Option<&'static Selector> {
+    static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+    SELECTOR.get_or_init(|| Selector::parse(r#"[automation-id="order-total"]"#).ok()).as_ref()
+}
+
+fn row_selector() -> Option<&'static Selector> {
+    static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+    SELECTOR.get_or_init(|| Selector::parse("tr").ok()).as_ref()
+}
+
+fn td_selector() -> Option<&'static Selector> {
+    static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+    SELECTOR.get_or_init(|| Selector::parse("td").ok()).as_ref()
+}
+
+fn img_selector() -> Option<&'static Selector> {
+    static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+    SELECTOR.get_or_init(|| Selector::parse("img").ok()).as_ref()
+}
+
+fn class_scan_selector() -> Option<&'static Selector> {
+    static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
+    SELECTOR.get_or_init(|| Selector::parse("div, span, td").ok()).as_ref()
 }
 
 #[derive(Error, Debug)]
@@ -67,21 +163,7 @@ pub enum EmailType {
 }
 
 /// Parser for Walmart order emails
-pub struct WalmartEmailParser {
-    // Regex patterns compiled once for efficiency
-    order_id_pattern: Regex,
-    price_pattern: Regex,
-    product_class_pattern: Regex,
-    price_class_pattern: Regex,
-    date_pattern: Regex,
-    // Pattern to extract items from img alt attributes (shipping emails)
-    alt_item_pattern: Regex,
-    // Fuzzy match for itemName-* class pattern (store delivery emails)
-    item_name_class_pattern: Regex,
-    // Pattern to extract tracking number and carrier from shipping emails
-    // Matches: "Fedex tracking number 123456" or "UPS tracking number <a...>123456</a>"
-    tracking_pattern: Regex,
-}
+pub struct WalmartEmailParser;
 
 impl Default for WalmartEmailParser {
     fn default() -> Self {
@@ -89,63 +171,29 @@ impl Default for WalmartEmailParser {
     }
 }
 
+struct ParseContext<'a> {
+    html: &'a str,
+    lower: String,
+    document: Html,
+    document_before_p13n: Html,
+}
+
 impl WalmartEmailParser {
     pub fn new() -> Self {
-        Self {
-            // Match "Order number" or "Order #" followed by the ID
-            // The ID might be directly after, or inside an <a> tag
-            // Pattern handles: "Order number: 123" or "Order number:...<a...>123</a>"
-            order_id_pattern: Regex::new(
-                r"(?i)order\s*(?:number|#|num\.?)?[:\s]*(?:<[^>]*>)*\s*([0-9-]{10,})"
-            ).expect("Invalid order ID regex"),
-
-            // Match price formats: $123.45, $1,234.56
-            price_pattern: Regex::new(
-                r"\$\s*([0-9,]+\.?\d*)"
-            ).expect("Invalid price regex"),
-
-            // Fuzzy match for productName-* class pattern
-            product_class_pattern: Regex::new(
-                r"(?i)productName[a-zA-Z0-9_-]*"
-            ).expect("Invalid product class regex"),
-
-            // Fuzzy match for priceStyling-* class pattern
-            price_class_pattern: Regex::new(
-                r"(?i)priceStyling[a-zA-Z0-9_-]*"
-            ).expect("Invalid price class regex"),
-
-            // Common date formats in Walmart emails
-            // Format found: "Order date: Thu, Jan 22, 2026" - need to skip optional day-of-week prefix
-            date_pattern: Regex::new(
-                r"(?i)(?:ordered\s+on|order\s+date|placed\s+on)[:\s]*(?:\w+,\s+)?(\w+\s+\d{1,2},?\s+\d{4})"
-            ).expect("Invalid date regex"),
-
-            // Pattern to extract items from img alt attributes in shipping emails
-            // Format: "quantity N item ProductName" (e.g., "quantity 5 item 2025 Panini Donruss...")
-            alt_item_pattern: Regex::new(
-                r#"alt\s*=\s*["']quantity\s+(\d+)\s+item\s+([^"']+)["']"#
-            ).expect("Invalid alt item regex"),
-
-            // Fuzzy match for itemName-* class pattern (store delivery emails)
-            // These use "itemName-0-861324-47" instead of "productName-0-36726-75"
-            item_name_class_pattern: Regex::new(
-                r"(?i)itemName[a-zA-Z0-9_-]*"
-            ).expect("Invalid item name class regex"),
-
-            // Pattern to extract tracking number and carrier from shipping emails
-            // Matches: "Fedex tracking number 123456" or "UPS tracking number <a...>123456</a>"
-            // Carriers: FedEx, UPS, USPS, OnTrac
-            tracking_pattern: Regex::new(
-                r"(?i)(fedex|ups|usps|ontrac)\s+tracking\s+number\s*(?:<a[^>]*>)?([A-Z0-9]{10,30})(?:</a>)?"
-            ).expect("Invalid tracking regex"),
-        }
+        Self
     }
 
     /// Detect the type of email based on content
     pub fn detect_email_type(&self, html: &str) -> EmailType {
         let lower = html.to_lowercase();
+        self.detect_email_type_lower(&lower)
+    }
 
-        if lower.contains("order confirmed") || lower.contains("order confirmation") || lower.contains("thanks for your order") {
+    fn detect_email_type_lower(&self, lower: &str) -> EmailType {
+        if lower.contains("order confirmed")
+            || lower.contains("order confirmation")
+            || lower.contains("thanks for your order")
+        {
             EmailType::Confirmation
         } else if lower.contains("order cancel")
             || lower.contains("item cancel")
@@ -173,7 +221,7 @@ impl WalmartEmailParser {
     /// CRITICAL: This always returns a normalized (hyphen-free) ID
     pub fn extract_order_id(&self, html: &str) -> ParseResult<String> {
         // Try the standard "Order number" pattern first
-        if let Some(captures) = self.order_id_pattern.captures(html) {
+        if let Some(captures) = order_id_pattern().captures(html) {
             if let Some(id_match) = captures.get(1) {
                 let raw_id = id_match.as_str();
                 // NORMALIZE: Remove all hyphens to create consistent ID format
@@ -208,7 +256,7 @@ impl WalmartEmailParser {
     /// Returns (carrier, tracking_number) if found
     /// Supports: FedEx, UPS, USPS, OnTrac
     pub fn extract_tracking_info(&self, html: &str) -> Option<(String, String)> {
-        if let Some(captures) = self.tracking_pattern.captures(html) {
+        if let Some(captures) = tracking_pattern().captures(html) {
             if let (Some(carrier_match), Some(tracking_match)) = (captures.get(1), captures.get(2)) {
                 let carrier = carrier_match.as_str().to_string();
                 let tracking_number = tracking_match.as_str().to_string();
@@ -220,7 +268,7 @@ impl WalmartEmailParser {
 
     /// Extract the order date from email HTML
     pub fn extract_order_date(&self, html: &str) -> ParseResult<DateTime<Utc>> {
-        if let Some(captures) = self.date_pattern.captures(html) {
+        if let Some(captures) = date_pattern().captures(html) {
             if let Some(date_match) = captures.get(1) {
                 let date_str = date_match.as_str();
                 // Try to parse common date formats
@@ -255,34 +303,76 @@ impl WalmartEmailParser {
         Err(ParseError::DateParseError(date_str.to_string()))
     }
 
+    fn build_context<'a>(&self, html: &'a str) -> ParseContext<'a> {
+        let lower = html.to_lowercase();
+        let cutoff = Self::recommendations_cutoff(&lower, html.len());
+        let html_before_p13n = &html[..cutoff];
+
+        let document = Html::parse_document(html);
+        let document_before_p13n = Html::parse_document(html_before_p13n);
+
+        ParseContext {
+            html,
+            lower,
+            document,
+            document_before_p13n,
+        }
+    }
+
+    fn recommendations_cutoff(lower_html: &str, html_len: usize) -> usize {
+        let p13n_markers = [
+            "automation-id=\"p13n-module\"",
+            "automation-id='p13n-module'",
+            "p13n-products",
+            "you might also like",
+            "recommended for you",
+            "more from walmart",
+            "based on your order",
+            "continueyourshopping",
+        ];
+
+        let mut earliest_pos = html_len;
+        for marker in p13n_markers {
+            if let Some(pos) = lower_html.find(marker) {
+                if pos < earliest_pos {
+                    earliest_pos = pos;
+                }
+            }
+        }
+
+        earliest_pos
+    }
+
     /// Extract total price from email
     pub fn extract_total_price(&self, html: &str) -> Option<f64> {
-        let document = Html::parse_document(html);
+        let context = self.build_context(html);
+        self.extract_total_price_with_context(&context)
+    }
+
+    fn extract_total_price_with_context(&self, context: &ParseContext<'_>) -> Option<f64> {
+        let document = &context.document;
 
         // Strategy 1: Look for automation-id="order-total" (Walmart's standard marker)
-        if let Ok(selector) = Selector::parse(r#"[automation-id="order-total"]"#) {
-            for element in document.select(&selector) {
-                let text: String = element.text().collect();
-                // Look for the final price in this section (usually after "Includes all fees...")
-                if let Some(price) = self.extract_last_price(&text) {
+        if let Some(selector) = order_total_selector() {
+            for element in document.select(selector) {
+                if let Some(price) = self.extract_total_from_order_total_element(&element) {
                     return Some(price);
                 }
             }
         }
 
         // Strategy 2: Look for "Includes all fees, taxes and discounts" marker
-        let lower_html = html.to_lowercase();
-        if let Some(pos) = lower_html.find("includes all fees") {
+        if let Some(pos) = context.lower.find("includes all fees") {
             // Look for price within 300 chars after this marker
-            let search_region = &html[pos..std::cmp::min(pos + 300, html.len())];
+            let search_region = &context.html[pos..std::cmp::min(pos + 300, context.html.len())];
             if let Some(price) = self.extract_first_price(search_region) {
                 return Some(price);
             }
         }
 
         // Strategy 3: Look for totalChargedClass pattern (Walmart's charged amount)
-        if let Some(pos) = lower_html.find("totalchargedclass") {
-            let search_region = &html[pos..std::cmp::min(pos + 200, html.len())];
+        if let Some(pos) = context.lower.find("totalchargedclass") {
+            let search_region = &context.html[pos..std::cmp::min(pos + 200, context.html.len())];
             if let Some(price) = self.extract_first_price(search_region) {
                 return Some(price);
             }
@@ -292,9 +382,9 @@ impl WalmartEmailParser {
         let total_patterns = ["order total", "total:", "grand total", "total amount"];
 
         for pattern in total_patterns {
-            if let Some(pos) = lower_html.find(pattern) {
+            if let Some(pos) = context.lower.find(pattern) {
                 // Look for price within 200 chars after "total"
-                let search_region = &html[pos..std::cmp::min(pos + 200, html.len())];
+                let search_region = &context.html[pos..std::cmp::min(pos + 200, context.html.len())];
                 if let Some(price) = self.extract_first_price(search_region) {
                     return Some(price);
                 }
@@ -305,9 +395,85 @@ impl WalmartEmailParser {
         self.extract_price_from_styled_elements(&document)
     }
 
+    /// Extract total from the Walmart order-total section, ignoring "you saved" rows.
+    fn extract_total_from_order_total_element(&self, element: &ElementRef) -> Option<f64> {
+        let mut fallback_prices: Vec<f64> = Vec::new();
+
+        if let Some(selector) = row_selector() {
+            for row in element.select(selector) {
+                let row_text: String = row.text().collect();
+                let row_text_trimmed = row_text.trim();
+                if row_text_trimmed.is_empty() {
+                    continue;
+                }
+
+                let row_lower = row_text_trimmed.to_lowercase();
+
+                if row_lower.contains("you saved")
+                    || row_lower.contains("saved a total")
+                    || row_lower.contains("total savings")
+                {
+                    continue;
+                }
+
+                if row_lower.contains("includes all fees") {
+                    if let Some(price) = self.extract_first_price(row_text_trimmed) {
+                        return Some(price);
+                    }
+                }
+
+                if row_lower.contains("order total")
+                    || row_lower.contains("grand total")
+                    || row_lower.contains("total amount")
+                    || (row_lower.contains("total")
+                        && !row_lower.contains("subtotal")
+                        && !row_lower.contains("shipping")
+                        && !row_lower.contains("tax")
+                        && !row_lower.contains("discount")
+                        && !row_lower.contains("savings"))
+                {
+                    if let Some(price) = self.extract_first_price(row_text_trimmed) {
+                        return Some(price);
+                    }
+                }
+
+                if let Some(price) = self.extract_first_price(row_text_trimmed) {
+                    fallback_prices.push(price);
+                }
+            }
+        }
+
+        if let Some(price) = fallback_prices.last().copied() {
+            return Some(price);
+        }
+
+        let text: String = element.text().collect();
+        self.extract_last_price_excluding_savings(&text)
+    }
+
+    fn extract_last_price_excluding_savings(&self, text: &str) -> Option<f64> {
+        let lower = text.to_lowercase();
+        let mut cutoff: Option<usize> = None;
+
+        for marker in ["you saved", "saved a total", "total savings"] {
+            if let Some(pos) = lower.find(marker) {
+                cutoff = Some(match cutoff {
+                    Some(existing) => existing.min(pos),
+                    None => pos,
+                });
+            }
+        }
+
+        if let Some(pos) = cutoff {
+            return self.extract_last_price(&text[..pos]);
+        }
+
+        self.extract_last_price(text)
+    }
+
     /// Extract the first price found in a string
     fn extract_first_price(&self, text: &str) -> Option<f64> {
-        if let Some(captures) = self.price_pattern.captures(text) {
+        if let Some(captures) = price_pattern().captures(text) {
             if let Some(price_match) = captures.get(1) {
                 let price_str = price_match.as_str().replace(',', "");
                 return price_str.parse().ok();
@@ -319,7 +485,7 @@ impl WalmartEmailParser {
     /// Extract the last price found in a string (useful for order totals)
     fn extract_last_price(&self, text: &str) -> Option<f64> {
         let mut last_price = None;
-        for captures in self.price_pattern.captures_iter(text) {
+        for captures in price_pattern().captures_iter(text) {
             if let Some(price_match) = captures.get(1) {
                 let price_str = price_match.as_str().replace(',', "");
                 if let Ok(price) = price_str.parse::<f64>() {
@@ -332,12 +498,10 @@ impl WalmartEmailParser {
 
     /// Extract price from elements with priceStyling-like classes
     fn extract_price_from_styled_elements(&self, document: &Html) -> Option<f64> {
-        // Use a universal selector to find all elements
-        if let Ok(all_selector) = Selector::parse("*") {
-            for element in document.select(&all_selector) {
+        if let Some(selector) = class_scan_selector() {
+            for element in document.select(selector) {
                 if let Some(class) = element.value().attr("class") {
-                    // Use fuzzy matching for priceStyling-* classes
-                    if self.price_class_pattern.is_match(class) {
+                    if price_class_pattern().is_match(class) {
                         let text: String = element.text().collect();
                         if let Some(price) = self.extract_first_price(&text) {
                             return Some(price);
@@ -354,19 +518,58 @@ impl WalmartEmailParser {
         element.text().collect::<String>().trim().to_string()
     }
 
+    fn is_product_image_url(src: &str) -> bool {
+        if src.is_empty() {
+            return false;
+        }
+
+        let lower = src.to_ascii_lowercase();
+        if !lower.contains("walmartimages.com") {
+            return false;
+        }
+
+        if lower.contains("/dfw/")
+            || lower.contains("w-mt.co")
+            || lower.contains("rptrcks")
+            || lower.contains("pixel")
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn find_best_product_image(root: &ElementRef) -> Option<String> {
+        let img_selector = img_selector()?;
+        for img in root.select(img_selector) {
+            if let Some(src) = img.value().attr("src") {
+                if Self::is_product_image_url(src) {
+                    return Some(src.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Extract line items from email HTML using fuzzy class matching
     pub fn extract_items(&self, html: &str) -> Vec<LineItem> {
+        let context = self.build_context(html);
+        self.extract_items_with_context(&context)
+    }
+
+    fn extract_items_with_context(&self, context: &ParseContext<'_>) -> Vec<LineItem> {
         // Strategy 1: Extract items from img alt attributes (shipping email format)
         // Format: alt="quantity N item ProductName"
         // This is the most reliable method for shipping/delivery emails
-        let items = self.extract_items_from_alt_attributes(html);
+        let items = self.extract_items_from_alt_attributes(context);
         if !items.is_empty() {
             return items;
         }
 
         // Strategy 1.5: Extract items from itemName-* class (store delivery emails)
         // Store deliveries use "itemName-0-861324-47" instead of "productName-*"
-        let items = self.extract_items_from_item_name_class(html);
+        let items = self.extract_items_from_item_name_class(context);
         if !items.is_empty() {
             return items;
         }
@@ -375,18 +578,16 @@ impl WalmartEmailParser {
 
         // Strategy 2: Look for productName-* class pattern, but ONLY before the p13n section
         // The p13n (personalization) section contains recommended products, not order items
-        let html_before_p13n = self.get_html_before_recommendations(html);
-        let document = Html::parse_document(&html_before_p13n);
+        let document = &context.document_before_p13n;
 
-        // Use universal selector to get all elements
-        let all_selector = match Selector::parse("*") {
-            Ok(s) => s,
-            Err(_) => return items,
+        let all_selector = match class_scan_selector() {
+            Some(selector) => selector,
+            None => return items,
         };
 
-        for element in document.select(&all_selector) {
+        for element in document.select(all_selector) {
             if let Some(class) = element.value().attr("class") {
-                if self.product_class_pattern.is_match(class) {
+                if product_class_pattern().is_match(class) {
                     let name = Self::get_element_text(&element);
                     if !name.is_empty() && name.len() > 2 {
                         let mut item = LineItem::new(name, 1);
@@ -396,9 +597,9 @@ impl WalmartEmailParser {
                         if let Some(parent) = element.parent() {
                             if let Some(parent_elem) = ElementRef::wrap(parent) {
                                 // Look for price in parent's descendants
-                                for child in parent_elem.select(&all_selector) {
+                                for child in parent_elem.select(all_selector) {
                                     if let Some(child_class) = child.value().attr("class") {
-                                        if self.price_class_pattern.is_match(child_class) {
+                                        if price_class_pattern().is_match(child_class) {
                                             let text = Self::get_element_text(&child);
                                             if let Some(price) = self.extract_first_price(&text) {
                                                 item = item.with_price(price);
@@ -408,14 +609,8 @@ impl WalmartEmailParser {
                                     }
                                 }
 
-                                // Look for image URL in parent's descendants
-                                if let Ok(img_selector) = Selector::parse("img") {
-                                    for img in parent_elem.select(&img_selector) {
-                                        if let Some(src) = img.value().attr("src") {
-                                            item = item.with_image(src.to_string());
-                                            break;
-                                        }
-                                    }
+                                if let Some(src) = Self::find_best_product_image(&parent_elem) {
+                                    item = item.with_image(src);
                                 }
                             }
                         }
@@ -428,7 +623,7 @@ impl WalmartEmailParser {
 
         // Strategy 3: Fallback - look for table rows with product info
         if items.is_empty() {
-            items = self.extract_items_from_tables(&document);
+            items = self.extract_items_from_tables(document);
         }
 
         items
@@ -436,10 +631,66 @@ impl WalmartEmailParser {
 
     /// Extract items from img alt attributes (used in shipping emails)
     /// Format: alt="quantity N item ProductName"
-    fn extract_items_from_alt_attributes(&self, html: &str) -> Vec<LineItem> {
+    fn extract_items_from_alt_attributes(&self, context: &ParseContext<'_>) -> Vec<LineItem> {
         let mut items = Vec::new();
 
-        for captures in self.alt_item_pattern.captures_iter(html) {
+        let document = &context.document_before_p13n;
+        let img_selector = match img_selector() {
+            Some(sel) => sel,
+            None => return items,
+        };
+
+        let mut index_by_name: HashMap<String, usize> = HashMap::new();
+        for img in document.select(img_selector) {
+            let alt = match img.value().attr("alt") {
+                Some(value) => value.trim(),
+                None => continue,
+            };
+            if alt.is_empty() {
+                continue;
+            }
+
+            let src = match img.value().attr("src") {
+                Some(value) => value.trim(),
+                None => continue,
+            };
+
+            if !Self::is_product_image_url(src) {
+                continue;
+            }
+
+            if let Some(captures) = alt_item_text_pattern().captures(alt) {
+                if let (Some(qty_match), Some(name_match)) = (captures.get(1), captures.get(2)) {
+                    let quantity: u32 = qty_match.as_str().parse().unwrap_or(1);
+                    let name = name_match.as_str().trim().to_string();
+                    if name.is_empty() || name.len() <= 3 {
+                        continue;
+                    }
+
+                    let key = name.to_ascii_lowercase();
+                    if let Some(existing_idx) = index_by_name.get(&key).copied() {
+                        let existing = &mut items[existing_idx];
+                        if existing.image_url.is_none() {
+                            existing.image_url = Some(src.to_string());
+                        }
+                        if quantity > existing.quantity {
+                            existing.quantity = quantity;
+                        }
+                    } else {
+                        let mut item = LineItem::new(name, quantity);
+                        item = item.with_image(src.to_string());
+                        index_by_name.insert(key, items.len());
+                        items.push(item);
+                    }
+                }
+            }
+        }
+
+        if !items.is_empty() {
+            return items;
+        }
+
+        for captures in alt_item_pattern().captures_iter(context.html) {
             if let (Some(qty_match), Some(name_match)) = (captures.get(1), captures.get(2)) {
                 let quantity: u32 = qty_match.as_str().parse().unwrap_or(1);
                 let name = name_match.as_str().trim().to_string();
@@ -458,18 +709,18 @@ impl WalmartEmailParser {
     /// These use a different class naming scheme than productName-* (confirmation emails)
     /// Structure: <span class="itemName-0-861324-47">Product Name</span>
     ///   with sibling cells containing "$499.00/EA", "Qty: 1", and image
-    fn extract_items_from_item_name_class(&self, html: &str) -> Vec<LineItem> {
-        let document = Html::parse_document(html);
+    fn extract_items_from_item_name_class(&self, context: &ParseContext<'_>) -> Vec<LineItem> {
+        let document = &context.document_before_p13n;
         let mut items = Vec::new();
 
-        let all_selector = match Selector::parse("*") {
-            Ok(sel) => sel,
-            Err(_) => return items,
+        let all_selector = match class_scan_selector() {
+            Some(sel) => sel,
+            None => return items,
         };
 
-        for element in document.select(&all_selector) {
+        for element in document.select(all_selector) {
             if let Some(class) = element.value().attr("class") {
-                if !self.item_name_class_pattern.is_match(class) {
+                if !item_name_class_pattern().is_match(class) {
                     continue;
                 }
 
@@ -536,17 +787,8 @@ impl WalmartEmailParser {
                         }
                     }
 
-                    // Extract image URL from <img> in the row
-                    if let Ok(img_sel) = Selector::parse("img") {
-                        for img in row.select(&img_sel) {
-                            if let Some(src) = img.value().attr("src") {
-                                // Skip tracking pixels and tiny spacer images
-                                if src.contains("walmartimages.com") && !src.contains("/dfw/") {
-                                    item = item.with_image(src.to_string());
-                                    break;
-                                }
-                            }
-                        }
+                    if let Some(src) = Self::find_best_product_image(&row) {
+                        item = item.with_image(src);
                     }
                 }
 
@@ -557,45 +799,13 @@ impl WalmartEmailParser {
         items
     }
 
-    /// Get HTML content before the recommendations/personalization section
-    /// The p13n-module section contains recommended products, not order items
-    fn get_html_before_recommendations(&self, html: &str) -> String {
-        // Look for markers that indicate the start of the recommendations section
-        let p13n_markers = [
-            "automation-id=\"p13n-module\"",
-            "automation-id='p13n-module'",
-            "p13n-products",
-            "you might also like",
-            "recommended for you",
-            "more from walmart",
-            "based on your order",
-            // Store delivery emails use "athznid=ContinueYourShopping" in recommendation URLs
-            "continueyourshopping",
-        ];
-
-        let lower_html = html.to_lowercase();
-        let mut earliest_pos = html.len();
-
-        for marker in p13n_markers {
-            // Markers are already lowercase, no need to re-lowercase them
-            if let Some(pos) = lower_html.find(marker) {
-                if pos < earliest_pos {
-                    earliest_pos = pos;
-                }
-            }
-        }
-
-        // Return only the part of HTML before recommendations
-        html[..earliest_pos].to_string()
-    }
-
     /// Fallback: Extract items from table structures (common in older email formats)
     fn extract_items_from_tables(&self, document: &Html) -> Vec<LineItem> {
         let mut items = Vec::new();
 
         // Try to find table rows that look like product listings
-        if let Ok(tr_selector) = Selector::parse("tr") {
-            for row in document.select(&tr_selector) {
+        if let Some(tr_selector) = row_selector() {
+            for row in document.select(tr_selector) {
                 let row_text: String = row.text().collect();
 
                 // Skip header rows and non-product rows
@@ -608,8 +818,8 @@ impl WalmartEmailParser {
                 if let Some(price) = self.extract_first_price(&row_text) {
                     // Get the first non-price text as product name
                     let mut cells: Vec<String> = Vec::new();
-                    if let Ok(td_selector) = Selector::parse("td") {
-                        for cell in row.select(&td_selector) {
+                    if let Some(td_selector) = td_selector() {
+                        for cell in row.select(td_selector) {
                             let text = Self::get_element_text(&cell);
                             if !text.is_empty() {
                                 cells.push(text);
@@ -631,16 +841,19 @@ impl WalmartEmailParser {
         items
     }
 
-    /// Parse a complete order from email HTML
-    pub fn parse_order(&self, html: &str) -> ParseResult<WalmartOrder> {
-        let email_type = self.detect_email_type(html);
+    /// Parse a complete order from email HTML.
+    /// `fallback_date` is used when HTML date extraction fails (e.g. gmail_date).
+    pub fn parse_order(&self, html: &str, fallback_date: Option<DateTime<Utc>>) -> ParseResult<WalmartOrder> {
+        let context = self.build_context(html);
+        let email_type = self.detect_email_type_lower(&context.lower);
         let order_id = self.extract_order_id(html)?;
 
-        // For dates, use a fallback to now if not found
-        let order_date = self.extract_order_date(html).unwrap_or_else(|_| Utc::now());
+        // For dates, prefer HTML extraction, then fallback_date, then now
+        let order_date = self.extract_order_date(html)
+            .unwrap_or_else(|_| fallback_date.unwrap_or_else(Utc::now));
 
-        let total_cost = self.extract_total_price(html);
-        let items = self.extract_items(html);
+        let total_cost = self.extract_total_price_with_context(&context);
+        let items = self.extract_items_with_context(&context);
 
         // Determine status based on email type
         let status = match email_type {
@@ -724,6 +937,30 @@ mod tests {
         "#
     }
 
+    fn sample_shipping_alt_images_html() -> &'static str {
+        r#"
+        <html>
+        <body>
+            <div>Thanks for your delivery order</div>
+            <table>
+                <tr>
+                    <td>
+                        <img src="https://i5.walmartimages.com/seo/POKEMON-ME2-5-ASCENDED-HEROES.jpeg"
+                             alt="quantity 5 item Pokemon Trading Card Game Mega Evolution 2 5 Ascended Heroes Tech Sticker Collection Randomly Selected" />
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <img src="https://i5.walmartimages.com/seo/POKEMON-POSTER-COLLECTION.jpeg"
+                             alt="quantity 2 item Pokemon Scarlet &amp; Violet Poster Collection" />
+                    </td>
+                </tr>
+            </table>
+        </body>
+        </html>
+        "#
+    }
+
     /// Create sample Walmart cancellation email HTML (uses plain ID format)
     fn sample_cancellation_html() -> &'static str {
         r#"
@@ -743,7 +980,18 @@ mod tests {
             </div>
         </body>
         </html>
-        "#
+        "# 
+    }
+
+    #[test]
+    fn test_shipping_alt_images_extracts_images() {
+        let parser = WalmartEmailParser::new();
+        let items = parser.extract_items(sample_shipping_alt_images_html());
+
+        assert_eq!(items.len(), 2, "Should extract two items from alt images");
+        assert!(items.iter().all(|item| item.image_url.is_some()), "Each item should have an image");
+        assert_eq!(items[0].quantity, 5);
+        assert_eq!(items[1].quantity, 2);
     }
 
     #[test]
@@ -849,7 +1097,7 @@ mod tests {
         let parser = WalmartEmailParser::new();
         let html = sample_confirmation_html();
 
-        let order = parser.parse_order(html).expect("Should parse order");
+        let order = parser.parse_order(html, None).expect("Should parse order");
 
         assert_eq!(order.id, "200014170653310");
         assert_eq!(order.status, OrderStatus::Confirmed);
@@ -862,7 +1110,7 @@ mod tests {
         let parser = WalmartEmailParser::new();
         let html = sample_cancellation_html();
 
-        let order = parser.parse_order(html).expect("Should parse order");
+        let order = parser.parse_order(html, None).expect("Should parse order");
 
         assert_eq!(order.id, "200014170653310");
         // Should be canceled or partially canceled based on items found
@@ -955,6 +1203,32 @@ mod tests {
         let total = parser.extract_total_price(html);
         assert!(total.is_some(), "Should extract total from automation-id section");
         assert!((total.unwrap() - 106.84).abs() < 0.01, "Total should be $106.84");
+    }
+
+    #[test]
+    fn test_extract_total_ignores_savings_row() {
+        let parser = WalmartEmailParser::new();
+
+        let html = r#"
+        <html>
+        <body>
+            <table automation-id="order-total">
+                <tr>
+                    <td><strong>Includes all fees, taxes, discounts and driver tip</strong></td>
+                    <td><strong>$641.23</strong></td>
+                </tr>
+                <tr>
+                    <td>You saved a total of</td>
+                    <td><strong>$960.24</strong></td>
+                </tr>
+            </table>
+        </body>
+        </html>
+        "#;
+
+        let total = parser.extract_total_price(html);
+        assert!(total.is_some(), "Should extract total from order-total section");
+        assert!((total.unwrap() - 641.23).abs() < 0.01, "Total should be $641.23");
     }
 
     #[test]
@@ -1082,7 +1356,7 @@ mod tests {
     fn test_store_delivery_full_parse() {
         let parser = WalmartEmailParser::new();
         let order = parser
-            .parse_order(sample_store_delivery_html())
+            .parse_order(sample_store_delivery_html(), None)
             .expect("Should parse store delivery order");
 
         assert_eq!(order.id, "200013235127884");
@@ -1171,7 +1445,7 @@ mod tests {
     fn test_canceled_pickup_full_parse() {
         let parser = WalmartEmailParser::new();
         let order = parser
-            .parse_order(sample_canceled_pickup_html())
+            .parse_order(sample_canceled_pickup_html(), None)
             .expect("Should parse canceled pickup order");
 
         assert_eq!(order.id, "200013331515436");

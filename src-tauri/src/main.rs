@@ -88,6 +88,10 @@ fn main() {
                         .join("orders.db")
                 });
 
+            // Canonicalize to absolute path so the sqlx pool connection string
+            // is never ambiguous across different tokio runtimes / working directories.
+            let db_path = std::fs::canonicalize(&db_path).unwrap_or(db_path);
+
             tracing::info!("Using database: {}", db_path.display());
 
             // Find client_secret.json for OAuth
@@ -104,24 +108,22 @@ fn main() {
 
             tracing::info!("Using client_secret: {}", client_secret_path.display());
 
-            // Use tokio runtime for async initialization
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+            // Ensure parent directory exists (synchronous, before async DB init)
+            if let Some(parent) = db_path.parent() {
+                let parent: &Path = parent;
+                if !parent.exists() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
 
-            let db = rt
-                .block_on(async {
-                    // Ensure parent directory exists
-                    if let Some(parent) = db_path.parent() {
-                        let parent: &Path = parent;
-                        if !parent.exists() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                    }
-
-                    let db = Database::from_file(&db_path).await?;
-                    db.run_migrations().await?;
-                    Ok::<_, anyhow::Error>(db)
-                })
-                .expect("Failed to initialize database");
+            // Initialize DB on the Tauri async runtime — avoids creating a
+            // throwaway tokio Runtime whose death could orphan pool connections.
+            let db = tauri::async_runtime::block_on(async {
+                let db = Database::from_file(&db_path).await?;
+                db.run_migrations().await?;
+                Ok::<_, anyhow::Error>(db)
+            })
+            .expect("Failed to initialize database");
 
             // Wrap db in Arc (SqlitePool is already Send+Sync, no Mutex needed)
             let db = Arc::new(db);
@@ -199,6 +201,7 @@ fn main() {
                     &db_for_email_check,
                     &client_secret_for_check,
                     &base_dir,
+                    None, // No fetchSince at startup; frontend will re-check with user's date
                 )
                 .await;
 
@@ -215,6 +218,8 @@ fn main() {
             commands::get_db_path,
             commands::get_tracking_status,
             commands::fetch_tracking,
+            commands::get_cached_image,
+            commands::get_cached_thumbnails,
             commands::list_accounts,
             commands::restart_tracking_session,
             commands::process_emails,

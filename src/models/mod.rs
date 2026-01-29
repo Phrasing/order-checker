@@ -148,6 +148,8 @@ pub struct WalmartOrder {
     pub tracking_number: Option<String>,
     /// Carrier name (FedEx, UPS, USPS, etc.)
     pub carrier: Option<String>,
+    /// Recipient email address
+    pub recipient: Option<String>,
     /// Associated Gmail account ID (for multi-account support)
     pub account_id: Option<i64>,
 }
@@ -177,12 +179,18 @@ impl WalmartOrder {
             items: Vec::new(),
             tracking_number: None,
             carrier: None,
+            recipient: None,
             account_id: None,
         }
     }
 
     pub fn with_account(mut self, account_id: Option<i64>) -> Self {
         self.account_id = account_id;
+        self
+    }
+
+    pub fn with_recipient(mut self, recipient: Option<String>) -> Self {
+        self.recipient = recipient;
         self
     }
 

@@ -8,13 +8,22 @@
 use crate::auth::GmailClient;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE, Engine};
+use google_gmail1::client::Error as GmailApiError;
 use google_gmail1::api::Scope;
+use google_gmail1::hyper::StatusCode;
+use mailparse::MailHeaderMap;
+use std::time::Duration;
+use tokio::time::sleep;
 
 /// Base search query for Walmart order emails
 /// Matches: order confirmations, cancellations, shipping updates, delivery/arrival
 /// Uses "from:walmart" to match both walmart.com and help@walmart.com
 const WALMART_BASE_QUERY: &str =
     "from:walmart subject:(order OR preorder OR canceled OR cancelled OR delivery OR delivered OR shipped OR delayed OR confirmed OR confirmation OR arrived)";
+
+const MAX_FETCH_RETRIES: usize = 4;
+const FETCH_BASE_DELAY_MS: u64 = 500;
+const FETCH_MAX_DELAY_MS: u64 = 8000;
 
 /// Build the Walmart search query with an optional date filter
 pub fn build_walmart_query(days: Option<u32>) -> String {
@@ -45,6 +54,8 @@ pub struct FetchedEmail {
     pub snippet: Option<String>,
     /// Sender email
     pub sender: Option<String>,
+    /// Recipient email
+    pub recipient: Option<String>,
     /// Raw email body (decoded from base64)
     pub raw_body: String,
     /// Gmail internal date (milliseconds since epoch)
@@ -91,27 +102,48 @@ impl GmailFetcher {
     pub async fn list_emails_with_query(&self, query: &str) -> Result<Vec<MessageRef>> {
         let mut all_messages = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut had_retries = false;
 
         tracing::info!("Searching Gmail with query: {}", query);
 
         loop {
+            let mut attempt = 0usize;
             // Build the list request with explicit readonly scope
-            let mut request = self.client
-                .users()
-                .messages_list(&self.user_id)
-                .q(query)
-                .max_results(500)
-                .add_scope(Scope::Readonly); // Explicit scope
+            let response = loop {
+                let mut request = self.client
+                    .users()
+                    .messages_list(&self.user_id)
+                    .q(query)
+                    .max_results(500)
+                    .add_scope(Scope::Readonly); // Explicit scope
 
-            if let Some(token) = &page_token {
-                request = request.page_token(token);
-            }
+                if let Some(token) = &page_token {
+                    request = request.page_token(token);
+                }
 
-            // Execute the request
-            let (_, response) = request
-                .doit()
-                .await
-                .context("Failed to list Gmail messages")?;
+                // Execute the request with retry for transient errors
+                match request.doit().await.context("Failed to list Gmail messages") {
+                    Ok((_, response)) => break response,
+                    Err(err) => {
+                        if is_retryable_email_error(&err) && attempt < MAX_FETCH_RETRIES {
+                            let jitter_key = page_token.as_deref().unwrap_or(query);
+                            let delay = retry_delay(attempt, jitter_key);
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                delay_ms = delay.as_millis() as u64,
+                                error = %err,
+                                "Transient Gmail list error, retrying"
+                            );
+                            had_retries = true;
+                            sleep(delay).await;
+                            attempt += 1;
+                            continue;
+                        }
+
+                        return Err(err);
+                    }
+                }
+            };
 
             // Extract message references
             if let Some(messages) = response.messages {
@@ -134,6 +166,12 @@ impl GmailFetcher {
             }
         }
 
+        if had_retries {
+            tracing::warn!(
+                total = all_messages.len(),
+                "Gmail list required retries; sync may be incomplete if rate limits persist"
+            );
+        }
         tracing::info!("Found {} Walmart-related emails", all_messages.len());
         Ok(all_messages)
     }
@@ -167,8 +205,8 @@ impl GmailFetcher {
             String::new()
         };
 
-        // Extract headers for subject and sender
-        let (subject, sender) = self.extract_headers(&message);
+        // Extract headers for subject, sender, and recipient
+        let (subject, sender, recipient) = self.extract_headers(&message);
 
         Ok(FetchedEmail {
             gmail_id: message.id.unwrap_or_default(),
@@ -176,6 +214,7 @@ impl GmailFetcher {
             subject,
             snippet: message.snippet,
             sender,
+            recipient,
             raw_body,
             internal_date: message.internal_date.map(|d| d.to_string()),
         })
@@ -194,32 +233,37 @@ impl GmailFetcher {
             .await
             .context(format!("Failed to fetch email {}", message_id))?;
 
-        // The raw field contains the base64url-encoded MIME message
-        let (raw_body, subject, sender) = if let Some(ref raw) = message.raw {
-            let raw_str = String::from_utf8_lossy(raw);
+        // The raw field contains the MIME message. The google-gmail1 crate may
+        // already base64-decode it, so try decoding first and fall back to using
+        // the raw bytes directly if that fails.
+        let (raw_body, subject, sender, recipient) = if let Some(ref raw) = message.raw {
+            // Try base64 decoding (URL-safe then standard), fall back to raw bytes
+            let mime_bytes = {
+                let raw_str = String::from_utf8_lossy(raw);
+                URL_SAFE.decode(raw_str.as_bytes())
+                    .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw_str.as_bytes()))
+                    .unwrap_or_else(|_| raw.clone())
+            };
 
-            // Try URL-safe base64 first, then standard base64
-            let decoded = URL_SAFE.decode(raw_str.as_bytes())
-                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(raw_str.as_bytes()));
-
-            match decoded {
-                Ok(bytes) => {
-                    let mime_content = String::from_utf8_lossy(&bytes).to_string();
-                    // Extract headers from MIME content
-                    let (subj, sndr) = extract_headers_from_mime(&mime_content);
-                    // Extract HTML from MIME content
-                    let html = extract_html_from_mime(&mime_content);
-                    (html, subj, sndr)
+            // Use mailparse to parse the MIME structure
+            match mailparse::parse_mail(&mime_bytes) {
+                Ok(parsed) => {
+                    let subject = parsed.headers.get_first_header("Subject").map(|h| h.get_value());
+                    let sender = parsed.headers.get_first_header("From").map(|h| h.get_value());
+                    let recipient = parsed.headers.get_first_header("To").map(|h| h.get_value());
+                    let html = find_html_part(&parsed).unwrap_or_default();
+                    if html.is_empty() {
+                        tracing::warn!("No HTML part found for email {}", message_id);
+                    }
+                    (html, subject, sender, recipient)
                 }
-                Err(_) => {
-                    let mime_content = raw_str.to_string();
-                    let (subj, sndr) = extract_headers_from_mime(&mime_content);
-                    let html = extract_html_from_mime(&mime_content);
-                    (html, subj, sndr)
+                Err(e) => {
+                    tracing::warn!("Failed to parse MIME for email {}: {}", message_id, e);
+                    (String::new(), None, None, None)
                 }
             }
         } else {
-            (String::new(), None, None)
+            (String::new(), None, None, None)
         };
 
         Ok(FetchedEmail {
@@ -228,15 +272,55 @@ impl GmailFetcher {
             subject,
             snippet: message.snippet,
             sender,
+            recipient,
             raw_body,
             internal_date: message.internal_date.map(|d| d.to_string()),
         })
     }
 
-    /// Extract subject and sender from message headers
-    fn extract_headers(&self, message: &google_gmail1::api::Message) -> (Option<String>, Option<String>) {
+    /// Fetch the full content of a single email with retries for transient errors.
+    /// Returns Ok(None) when the message no longer exists (404).
+    pub async fn fetch_email_full_with_retry(&self, message_id: &str) -> Result<Option<FetchedEmail>> {
+        let mut attempt = 0usize;
+
+        loop {
+            match self.fetch_email_full(message_id).await {
+                Ok(email) => return Ok(Some(email)),
+                Err(err) => {
+                    if is_not_found_email_error(&err) {
+                        tracing::warn!(
+                            message_id = %message_id,
+                            error = %err,
+                            "Email no longer exists in Gmail, skipping"
+                        );
+                        return Ok(None);
+                    }
+
+                    if is_retryable_email_error(&err) && attempt < MAX_FETCH_RETRIES {
+                        let delay = retry_delay(attempt, message_id);
+                        tracing::warn!(
+                            message_id = %message_id,
+                            attempt = attempt + 1,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %err,
+                            "Transient Gmail fetch error, retrying"
+                        );
+                        sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Extract subject, sender, and recipient from message headers
+    fn extract_headers(&self, message: &google_gmail1::api::Message) -> (Option<String>, Option<String>, Option<String>) {
         let mut subject = None;
         let mut sender = None;
+        let mut recipient = None;
 
         if let Some(payload) = &message.payload {
             if let Some(headers) = &payload.headers {
@@ -245,6 +329,7 @@ impl GmailFetcher {
                         match name.to_lowercase().as_str() {
                             "subject" => subject = Some(value.clone()),
                             "from" => sender = Some(value.clone()),
+                            "to" => recipient = Some(value.clone()),
                             _ => {}
                         }
                     }
@@ -252,89 +337,7 @@ impl GmailFetcher {
             }
         }
 
-        (subject, sender)
-    }
-
-    /// Extract the HTML body from message payload
-    fn extract_body_from_payload(&self, message: &google_gmail1::api::Message) -> String {
-        if let Some(payload) = &message.payload {
-            // Debug: log the payload structure
-            tracing::debug!(
-                "Payload: mime_type={:?}, has_body={}, has_parts={}, parts_count={}",
-                payload.mime_type,
-                payload.body.is_some(),
-                payload.parts.is_some(),
-                payload.parts.as_ref().map(|p| p.len()).unwrap_or(0)
-            );
-
-            // Try to find HTML part first, then plain text
-            if let Some(body) = self.find_body_part(payload, "text/html") {
-                return body;
-            }
-            if let Some(body) = self.find_body_part(payload, "text/plain") {
-                return body;
-            }
-
-            // Fallback: if payload itself has body data, decode it
-            if let Some(body) = &payload.body {
-                if let Some(data) = &body.data {
-                    let data_str = String::from_utf8_lossy(data);
-                    tracing::debug!("Using payload body directly, data length: {}", data.len());
-                    if let Ok(bytes) = URL_SAFE.decode(data_str.as_bytes()) {
-                        return String::from_utf8_lossy(&bytes).to_string();
-                    }
-                }
-            }
-        }
-        String::new()
-    }
-
-    /// Recursively search for a body part with the specified MIME type
-    fn find_body_part(&self, part: &google_gmail1::api::MessagePart, mime_type: &str) -> Option<String> {
-        // Log what we're looking at
-        let part_mime = part.mime_type.as_deref().unwrap_or("none");
-        let has_data = part.body.as_ref().and_then(|b| b.data.as_ref()).is_some();
-        let data_len = part.body.as_ref()
-            .and_then(|b| b.data.as_ref())
-            .map(|d| d.len())
-            .unwrap_or(0);
-
-        tracing::trace!(
-            "Examining part: mime={}, has_data={}, data_len={}, num_parts={}",
-            part_mime,
-            has_data,
-            data_len,
-            part.parts.as_ref().map(|p| p.len()).unwrap_or(0)
-        );
-
-        // First, search in child parts (for multipart messages)
-        if let Some(parts) = &part.parts {
-            for (i, child) in parts.iter().enumerate() {
-                tracing::trace!("Searching child part {}", i);
-                if let Some(body) = self.find_body_part(child, mime_type) {
-                    return Some(body);
-                }
-            }
-        }
-
-        // Check if this part matches the requested MIME type
-        if part_mime == mime_type {
-            if let Some(body) = &part.body {
-                if let Some(data) = &body.data {
-                    // The data field is base64url-encoded bytes
-                    // First convert Vec<u8> to String, then decode base64
-                    let data_str = String::from_utf8_lossy(data);
-                    tracing::debug!("Found {} body, data length: {}", mime_type, data.len());
-                    return URL_SAFE.decode(data_str.as_bytes())
-                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                        .ok();
-                } else {
-                    tracing::trace!("Part matches {} but has no data", mime_type);
-                }
-            }
-        }
-
-        None
+        (subject, sender, recipient)
     }
 
     /// Get count of emails matching the Walmart query
@@ -352,6 +355,76 @@ impl GmailFetcher {
 
         Ok(response.result_size_estimate.unwrap_or(0))
     }
+}
+
+fn retry_delay(attempt: usize, message_id: &str) -> Duration {
+    let exp = 2u64.saturating_pow(attempt.min(6) as u32);
+    let base = FETCH_BASE_DELAY_MS.saturating_mul(exp);
+    let jitter = message_id
+        .bytes()
+        .take(6)
+        .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
+        % 250;
+    let delay_ms = (base + jitter).min(FETCH_MAX_DELAY_MS);
+    Duration::from_millis(delay_ms)
+}
+
+fn is_not_found_email_error(error: &anyhow::Error) -> bool {
+    status_from_error(error) == Some(StatusCode::NOT_FOUND)
+}
+
+pub fn is_retryable_email_error(error: &anyhow::Error) -> bool {
+    if let Some(status) = status_from_error(error) {
+        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::REQUEST_TIMEOUT {
+            return true;
+        }
+        if status.is_server_error() {
+            return true;
+        }
+        return false;
+    }
+
+    for cause in error.chain() {
+        if let Some(api_err) = cause.downcast_ref::<GmailApiError>() {
+            match api_err {
+                GmailApiError::HttpError(_) | GmailApiError::Io(_) | GmailApiError::JsonDecodeError(_, _) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            if matches!(
+                io_err.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::Interrupted
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+    }
+
+    let msg = error.to_string().to_lowercase();
+    msg.contains("timeout")
+        || msg.contains("temporarily")
+        || msg.contains("rate")
+        || msg.contains("unavailable")
+}
+
+fn status_from_error(error: &anyhow::Error) -> Option<StatusCode> {
+    for cause in error.chain() {
+        if let Some(api_err) = cause.downcast_ref::<GmailApiError>() {
+            if let GmailApiError::Failure(response) = api_err {
+                return Some(response.status());
+            }
+        }
+    }
+    None
 }
 
 /// Infer email event type from subject or snippet
@@ -377,155 +450,17 @@ pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'stati
     }
 }
 
-/// Extract Subject and From headers from raw MIME content
-fn extract_headers_from_mime(mime_content: &str) -> (Option<String>, Option<String>) {
-    let mut subject = None;
-    let mut sender = None;
+/// Recursively find the first text/html part in the MIME structure
+fn find_html_part(parsed: &mailparse::ParsedMail) -> Option<String> {
+    if parsed.ctype.mimetype == "text/html" {
+        return parsed.get_body().ok();
+    }
 
-    // Headers end at the first blank line
-    let header_end = mime_content.find("\r\n\r\n")
-        .or_else(|| mime_content.find("\n\n"))
-        .unwrap_or(mime_content.len().min(4096)); // Limit search to first 4KB
-
-    let headers = &mime_content[..header_end];
-
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("subject:") {
-            subject = Some(line[8..].trim().to_string());
-        } else if lower.starts_with("from:") {
-            sender = Some(line[5..].trim().to_string());
-        }
-
-        // Stop once we have both
-        if subject.is_some() && sender.is_some() {
-            break;
+    for subpart in &parsed.subparts {
+        if let Some(html) = find_html_part(subpart) {
+            return Some(html);
         }
     }
 
-    (subject, sender)
-}
-
-/// Extract the MIME boundary from a Content-Type header
-fn extract_mime_boundary(content: &str) -> Option<String> {
-    let lower = content.to_lowercase();
-    if let Some(boundary_pos) = lower.find("boundary=") {
-        let after_boundary = &content[boundary_pos + 9..];
-        // Handle quoted boundary: boundary="value" or unquoted: boundary=value
-        if after_boundary.starts_with('"') {
-            // Quoted boundary
-            if let Some(end_quote) = after_boundary[1..].find('"') {
-                return Some(after_boundary[1..end_quote + 1].to_string());
-            }
-        } else {
-            // Unquoted boundary - ends at whitespace, semicolon, or newline
-            let end = after_boundary.find(|c: char| c.is_whitespace() || c == ';')
-                .unwrap_or(after_boundary.len());
-            return Some(after_boundary[..end].to_string());
-        }
-    }
     None
-}
-
-/// Extract HTML content from a raw MIME email message
-fn extract_html_from_mime(mime_content: &str) -> String {
-    // First, try to extract the MIME boundary if this is a multipart message
-    let boundary = extract_mime_boundary(mime_content);
-
-    // Look for Content-Type: text/html section
-    let lower = mime_content.to_lowercase();
-
-    // Find the start of the HTML section
-    if let Some(html_type_pos) = lower.find("content-type: text/html") {
-        // Find the blank line that separates headers from content
-        let search_start = html_type_pos;
-        // Try both \r\n\r\n and \n\n for the blank line separator
-        let blank_line_offset = mime_content[search_start..].find("\r\n\r\n")
-            .map(|p| (p, 4))
-            .or_else(|| mime_content[search_start..].find("\n\n").map(|p| (p, 2)));
-
-        if let Some((offset, sep_len)) = blank_line_offset {
-            let content_start = search_start + offset + sep_len;
-
-            // Check if content is base64 or quoted-printable.
-            // Search backward from Content-Type to find the start of this header block
-            // (previous blank line or start of content). This ensures we find
-            // Content-Transfer-Encoding even when it appears before Content-Type.
-            let header_block_start = lower[..html_type_pos]
-                .rfind("\n\n")
-                .map(|pos| pos + 2)
-                .or_else(|| lower[..html_type_pos].rfind("\r\n\r\n").map(|pos| pos + 4))
-                .unwrap_or(0);
-            let header_section = &lower[header_block_start..content_start];
-
-            // Find the end of this MIME part using the specific boundary if available
-            let content = &mime_content[content_start..];
-            let content_end = if let Some(ref b) = boundary {
-                // Look for the specific MIME boundary: \r\n--boundary or \n--boundary
-                let boundary_marker = format!("--{}", b);
-                content.find(&format!("\r\n{}", boundary_marker))
-                    .or_else(|| content.find(&format!("\n{}", boundary_marker)))
-                    .unwrap_or(content.len())
-            } else {
-                content.len()
-            };
-
-            let part_content = &content[..content_end];
-
-            if header_section.contains("base64") {
-                // Decode base64
-                let cleaned = part_content.replace(['\r', '\n', ' '], "");
-                if let Ok(bytes) = URL_SAFE.decode(&cleaned).or_else(|_| {
-                    base64::engine::general_purpose::STANDARD.decode(&cleaned)
-                }) {
-                    return String::from_utf8_lossy(&bytes).to_string();
-                }
-            } else if header_section.contains("quoted-printable") {
-                // Decode quoted-printable
-                if let Ok(bytes) = quoted_printable::decode(
-                    part_content.as_bytes(),
-                    quoted_printable::ParseMode::Robust
-                ) {
-                    return String::from_utf8_lossy(&bytes).to_string();
-                }
-            } else {
-                // Plain content (7bit or 8bit)
-                return part_content.to_string();
-            }
-        }
-    }
-
-    // Fallback: The entire content might be quoted-printable encoded HTML
-    // Try to decode the whole thing and look for HTML
-    if let Ok(decoded_bytes) = quoted_printable::decode(
-        mime_content.as_bytes(),
-        quoted_printable::ParseMode::Robust
-    ) {
-        let decoded = String::from_utf8_lossy(&decoded_bytes);
-        if let Some(html_start) = decoded.find("<!DOCTYPE html").or_else(|| decoded.find("<!doctype html")) {
-            if let Some(html_end) = decoded[html_start..].find("</html>") {
-                return decoded[html_start..html_start + html_end + 7].to_string();
-            }
-        }
-        if let Some(html_start) = decoded.find("<html") {
-            if let Some(html_end) = decoded[html_start..].find("</html>") {
-                return decoded[html_start..html_start + html_end + 7].to_string();
-            }
-        }
-    }
-
-    // Last fallback: look for raw HTML tags (might be 7bit encoded)
-    if let Some(html_start) = mime_content.find("<!DOCTYPE html").or_else(|| mime_content.find("<!doctype html")) {
-        if let Some(html_end) = mime_content[html_start..].find("</html>") {
-            return mime_content[html_start..html_start + html_end + 7].to_string();
-        }
-    }
-
-    if let Some(html_start) = mime_content.find("<html") {
-        if let Some(html_end) = mime_content[html_start..].find("</html>") {
-            return mime_content[html_start..html_start + html_end + 7].to_string();
-        }
-    }
-
-    String::new()
 }

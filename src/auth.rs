@@ -6,7 +6,6 @@
 //! Supports multiple Gmail accounts with separate token caches.
 
 use anyhow::{anyhow, Context, Result};
-use google_gmail1::api::Scope;
 use google_gmail1::hyper::client::HttpConnector;
 use google_gmail1::hyper_rustls::HttpsConnector;
 use google_gmail1::{hyper, hyper_rustls, oauth2, Gmail};

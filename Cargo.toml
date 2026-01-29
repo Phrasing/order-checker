@@ -17,21 +17,13 @@ name = "walmart-cli"
 path = "src-cli/main.rs"
 
 [dependencies]
-# Web Framework
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "trace"] }
-
 # Async utilities
+tokio = { version = "1", features = ["full"] }
 futures = "0.3"
+num_cpus = "1"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
-
-# Templating
-askama = "0.12"
-askama_axum = "0.4"
 
 # HTML Parsing
 scraper = "0.18"
@@ -78,9 +70,14 @@ wreq = { git = "https://github.com/0x676e67/wreq", features = ["cookies", "json"
 wreq-util = { git = "https://github.com/0x676e67/wreq-util" }
 rand = "0.9.2"
 urlencoding = "2"
-
-# Tracking info from 17track.net (uses headless Chrome)
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "multipart"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rmbg = { version = "0.1", optional = true }
 track17-rs = { git = "https://github.com/Phrasing/track17-rs", branch = "main" }
+mailparse = "0.16.1"
+
+[features]
+rmbg = ["dep:rmbg"]
 
 [profile.release]
 codegen-units = 1

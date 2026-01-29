@@ -348,7 +348,7 @@
 
         .order-item {
             display: grid;
-            grid-template-columns: 140px 1fr auto auto auto auto;
+            grid-template-columns: 56px 140px 1fr auto auto auto auto;
             gap: 16px;
             align-items: center;
             padding: 14px 20px;
@@ -505,6 +505,27 @@
             display: flex;
             align-items: center;
             gap: 8px;
+        }
+
+        .item-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .item-thumb {
+            width: 44px;
+            height: 44px;
+            border-radius: 6px;
+            object-fit: contain;
+            background: transparent;
+            border: 1px solid var(--border-color);
+            flex: 0 0 auto;
+        }
+
+        .item-name {
+            flex: 1;
+            min-width: 0;
         }
 
         .item-qty {
@@ -829,6 +850,7 @@
             <div class="filter-section" id="date-range-section">
                 <div class="filter-label">Date Range</div>
                 <div class="date-presets">
+                    <button class="date-preset" data-days="1">24h</button>
                     <button class="date-preset" data-days="7">7d</button>
                     <button class="date-preset" data-days="30">30d</button>
                     <button class="date-preset" data-days="90">90d</button>
@@ -901,6 +923,7 @@
             <div class="order-list" id="order-list">
                 <!-- Loading skeleton -->
                 <div class="order-item">
+                    <div class="skeleton" style="width: 56px; height: 56px; border-radius: 10px;"></div>
                     <div class="order-main">
                         <div class="skeleton" style="width: 140px; height: 16px; margin-bottom: 6px;"></div>
                         <div class="skeleton" style="width: 80px; height: 14px;"></div>
@@ -919,3 +942,16 @@
     <script type="module" src="scripts/dashboard.js"></script>
 </body>
 </html>
+        .order-thumb {
+            width: 56px;
+            height: 56px;
+            border-radius: 10px;
+            object-fit: contain;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            display: block;
+        }
+
+        .order-thumb.placeholder {
+            background: var(--bg-tertiary);
+        }

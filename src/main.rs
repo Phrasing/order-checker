@@ -6,6 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod auth;
 mod db;
 mod ingestion;
+mod images;
 mod models;
 mod parsing;
 mod process;
@@ -57,13 +58,6 @@ enum Commands {
         /// Reset skipped/failed emails to pending before processing
         #[arg(long)]
         reset: bool,
-    },
-
-    /// Start the web dashboard server
-    Serve {
-        /// Port to run the web server on
-        #[arg(short, long, default_value = "3000")]
-        port: u16,
     },
 
     /// Show sync status and database statistics
@@ -281,15 +275,6 @@ async fn main() -> Result<()> {
             println!("\n{}", order_status);
         }
 
-        Commands::Serve { port } => {
-            // Initialize database
-            let db = Database::from_file(&db_path).await?;
-            db.run_migrations().await?;
-
-            println!("Starting web dashboard at http://localhost:{}", port);
-            web::serve(db, port).await?;
-        }
-
         Commands::DebugEmail { id } => {
             let db = Database::from_file(&db_path).await?;
             db.run_migrations().await?;
@@ -375,7 +360,7 @@ async fn main() -> Result<()> {
                 .await?;
 
             // Reset all emails to pending
-            let emails_reset = db.reset_email_status().await?;
+            let _emails_reset = db.reset_email_status().await?;
 
             // Also reset "processed" emails to "pending"
             let processed_reset = sqlx::query(

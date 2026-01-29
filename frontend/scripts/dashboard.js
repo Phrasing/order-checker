@@ -15,6 +15,8 @@ let currentSearchQuery = '';
 let newEmailCount = 0;
 let fetchSinceDate = localStorage.getItem('fetchSinceDate') || null;
 let isSyncing = false;
+let currentRenderedOrders = [];
+let expandedOrderId = null;
 
 // Status priority for sorting (lower = higher priority)
 const statusPriority = {
@@ -60,6 +62,11 @@ const trackingStateColors = {
 
 // Cache for tracking status
 const trackingCache = new Map();
+// Cache for image data URLs keyed by image_id
+const imageCache = new Map();
+// Cache for thumbnail data URLs keyed by image_id
+const thumbnailCache = new Map();
+let orderThumbObserver = null;
 
 /**
  * Get date range params from current preset
@@ -223,6 +230,22 @@ window.handleAccountChange = async function(value) {
 };
 
 /**
+ * Check for new/unsynced emails using the user's configured date range
+ */
+async function checkForNewEmails() {
+    try {
+        const args = {};
+        if (fetchSinceDate) args.fetchSince = fetchSinceDate;
+        const check = await invoke('check_new_emails', args);
+        console.log('New email check:', check);
+        newEmailCount = (check.total_new || 0) + (check.total_pending || 0);
+        updateSyncBadge();
+    } catch (e) {
+        console.error('Failed to check for new emails:', e);
+    }
+}
+
+/**
  * Update badge on Sync button showing count of new/pending emails
  */
 function updateSyncBadge() {
@@ -303,6 +326,7 @@ function searchOrders(orders, query) {
 
 function applyFiltersAndRender() {
     const filtered = searchOrders(filterOrders(allOrders, currentFilter), currentSearchQuery);
+    currentRenderedOrders = filtered;
     renderOrders(filtered);
 }
 
@@ -441,11 +465,18 @@ function renderOrders(orders) {
 
     // Apply current sort
     orders = sortOrders(orders, currentSort);
+    currentRenderedOrders = orders;
+    container.innerHTML = buildOrdersHtml(orders);
+    postRenderOrders();
+}
 
-    container.innerHTML = orders.map((order) => {
+function buildOrdersHtml(orders) {
+    return orders.map((order) => {
         const totalQty = order.items?.reduce((sum, item) => sum + (item.quantity || 1), 0) || 0;
+        const isExpanded = expandedOrderId === order.id;
         return `
-        <div class="order-item" data-order-id="${order.id}" onclick="toggleOrderDetails('${order.id}')">
+        <div class="order-item${isExpanded ? ' expanded' : ''}" data-order-id="${order.id}" onclick="toggleOrderDetails('${order.id}')">
+            ${renderOrderThumbnail(order)}
             <div class="order-main">
                 <div class="order-id">${escapeHtml(order.id)}</div>
                 <div class="order-date">${escapeHtml(displayDate(order))}</div>
@@ -456,10 +487,25 @@ function renderOrders(orders) {
             <span class="order-status status-${order.status}">${statusLabels[order.status] || order.status}</span>
             <div class="order-items-count">${order.items?.length || 0} items</div>
         </div>
-        <div class="order-details" id="details-${order.id}">
+        <div class="order-details${isExpanded ? ' show' : ''}" id="details-${order.id}">
             ${renderOrderDetails(order)}
         </div>
     `}).join('');
+}
+
+function postRenderOrders() {
+    observeOrderThumbnails();
+
+    if (expandedOrderId) {
+        const details = document.getElementById(`details-${expandedOrderId}`);
+        if (details) {
+            const order = (currentRenderedOrders || []).find(o => o.id === expandedOrderId);
+            if (order && order.tracking_number && !trackingCache.has(order.id)) {
+                loadCachedTrackingStatus(order.id);
+            }
+            loadOrderImages(expandedOrderId);
+        }
+    }
 }
 
 /**
@@ -472,8 +518,9 @@ function renderOrderDetails(order) {
 
     const itemsHtml = order.items?.length > 0
         ? `<ul class="item-list">${order.items.map(item => `
-            <li>
-                <span class="${item.status === 'canceled' ? 'item-canceled' : ''}">${escapeHtml(item.name)}</span>
+            <li class="item-row">
+                ${renderItemImage(item)}
+                <span class="item-name ${item.status === 'canceled' ? 'item-canceled' : ''}">${escapeHtml(item.name)}</span>
                 ${item.quantity > 1 ? `<span class="item-qty">x${item.quantity}</span>` : ''}
             </li>
         `).join('')}</ul>`
@@ -490,11 +537,40 @@ function renderOrderDetails(order) {
                 <div class="detail-value">${order.total_cost ? '$' + escapeHtml(order.total_cost) : '-'}</div>
             </div>
             <div class="detail-section">
+                <h4>Recipient</h4>
+                <div class="detail-value">${order.recipient ? escapeHtml(order.recipient) : '<span style="color: var(--text-tertiary);">-</span>'}</div>
+            </div>
+            <div class="detail-section">
                 <h4>Items</h4>
                 ${itemsHtml}
             </div>
         </div>
     `;
+}
+
+function renderOrderThumbnail(order) {
+    const imageId = order.thumbnail_id;
+    const imageUrl = order.thumbnail_url;
+    if (!imageId && !imageUrl) {
+        return '<div class="order-thumb placeholder"></div>';
+    }
+
+    const imageIdAttr = imageId ? ` data-image-id="${escapeHtml(imageId)}"` : '';
+    const fallbackAttr = imageUrl ? ` data-fallback-url="${escapeHtml(imageUrl)}"` : '';
+
+    return `<img class="order-thumb"${imageIdAttr}${fallbackAttr} alt="" loading="lazy">`;
+}
+
+function renderItemImage(item) {
+    if (!item.image_id && !item.image_url) {
+        return '';
+    }
+
+    const imageIdAttr = item.image_id ? ` data-image-id="${escapeHtml(item.image_id)}"` : '';
+    const fallbackAttr = item.image_url ? ` data-fallback-url="${escapeHtml(item.image_url)}"` : '';
+    const alt = escapeHtml(item.name || '');
+
+    return `<img class="item-thumb"${imageIdAttr}${fallbackAttr} alt="${alt}" loading="lazy">`;
 }
 
 /**
@@ -663,32 +739,14 @@ function renderTrackingLink(tracking, carrier) {
  * Toggle order details visibility
  */
 window.toggleOrderDetails = async function(orderId) {
-    const details = document.getElementById(`details-${orderId}`);
-    const item = document.querySelector(`.order-item[data-order-id="${orderId}"]`);
+    const container = document.getElementById('order-list');
+    const prevScroll = container ? container.scrollTop : 0;
 
-    // Close all other expanded details
-    document.querySelectorAll('.order-details.show').forEach(el => {
-        if (el.id !== `details-${orderId}`) {
-            el.classList.remove('show');
-        }
-    });
-    document.querySelectorAll('.order-item.expanded').forEach(el => {
-        if (el.dataset.orderId !== orderId) {
-            el.classList.remove('expanded');
-        }
-    });
+    expandedOrderId = expandedOrderId === orderId ? null : orderId;
+    renderOrders(currentRenderedOrders || []);
 
-    // Toggle current
-    const isExpanding = !details.classList.contains('show');
-    details.classList.toggle('show');
-    item.classList.toggle('expanded');
-
-    // Load cached tracking status from database when expanding
-    if (isExpanding) {
-        const order = allOrders.find(o => o.id === orderId);
-        if (order && order.tracking_number && !trackingCache.has(order.id)) {
-            loadCachedTrackingStatus(order.id);
-        }
+    if (container) {
+        container.scrollTop = prevScroll;
     }
 };
 
@@ -713,6 +771,125 @@ async function loadCachedTrackingStatus(orderId) {
     } catch (error) {
         console.error('Failed to load cached tracking:', error);
     }
+}
+
+async function loadOrderImages(orderId) {
+    const order = allOrders.find(o => o.id === orderId);
+    if (!order || !order.items) return;
+
+    const container = document.getElementById(`details-${orderId}`);
+    if (!container) return;
+
+    const images = container.querySelectorAll('img.item-thumb[data-image-id], img.item-thumb[data-fallback-url]');
+    await loadThumbnailsForElements(Array.from(images));
+}
+
+async function fetchCachedImage(imageId, fallbackUrl) {
+    try {
+        const result = await invoke('get_cached_image', { imageId });
+        if (!result || !result.data_url) {
+            return fallbackUrl || null;
+        }
+        imageCache.set(imageId, result.data_url);
+        return result.data_url;
+    } catch (error) {
+        console.warn('Failed to fetch cached image', imageId, error);
+        return fallbackUrl || null;
+    }
+}
+
+async function fetchCachedThumbnails(imageIds) {
+    const unique = imageIds.filter(id => id && !thumbnailCache.has(id));
+    if (unique.length === 0) {
+        return {};
+    }
+
+    try {
+        const result = await invoke('get_cached_thumbnails', { imageIds: unique });
+        if (result && typeof result === 'object') {
+            for (const [id, dataUrl] of Object.entries(result)) {
+                if (dataUrl) {
+                    thumbnailCache.set(id, dataUrl);
+                }
+            }
+        }
+        return result || {};
+    } catch (error) {
+        console.warn('Failed to fetch cached thumbnails', error);
+        return {};
+    }
+}
+
+function applyThumbnailSrc(img, dataUrl) {
+    img.setAttribute('src', dataUrl);
+    img.setAttribute('srcset', `${dataUrl} 2x`);
+}
+
+async function loadThumbnailsForElements(elements) {
+    const pending = [];
+    const ids = new Set();
+
+    elements.forEach(img => {
+        if (!img || img.getAttribute('src')) return;
+        const imageId = img.getAttribute('data-image-id');
+        const fallbackUrl = img.getAttribute('data-fallback-url');
+
+        if (!imageId) {
+            if (fallbackUrl) img.setAttribute('src', fallbackUrl);
+            return;
+        }
+
+        const cached = thumbnailCache.get(imageId);
+        if (cached) {
+            applyThumbnailSrc(img, cached);
+            return;
+        }
+
+        ids.add(imageId);
+        pending.push({ img, imageId, fallbackUrl });
+    });
+
+    if (ids.size === 0) {
+        return;
+    }
+
+    const fetched = await fetchCachedThumbnails(Array.from(ids));
+    pending.forEach(({ img, imageId, fallbackUrl }) => {
+        const dataUrl = thumbnailCache.get(imageId) || fetched?.[imageId];
+        if (dataUrl) {
+            applyThumbnailSrc(img, dataUrl);
+        } else if (fallbackUrl) {
+            img.setAttribute('src', fallbackUrl);
+        }
+    });
+}
+
+function observeOrderThumbnails() {
+    if (orderThumbObserver) {
+        orderThumbObserver.disconnect();
+    }
+
+    const root = document.getElementById('order-list');
+    orderThumbObserver = new IntersectionObserver(
+        (entries) => {
+            const visible = [];
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const img = entry.target;
+                    orderThumbObserver.unobserve(img);
+                    visible.push(img);
+                }
+            });
+            if (visible.length > 0) {
+                loadThumbnailsForElements(visible);
+            }
+        },
+        { root, rootMargin: '200px 0px' }
+    );
+
+    document
+        .querySelectorAll('img.order-thumb[data-image-id], img.order-thumb[data-fallback-url]')
+        .forEach(img => orderThumbObserver.observe(img));
 }
 
 /**
@@ -823,6 +1000,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupFilterListeners();
     setupDatePresetListeners();
     setupFetchSincePicker();
+    checkForNewEmails();
     loadDashboard();
 
     // Listen for tracking sync complete event from backend
