@@ -14,15 +14,17 @@ use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::env;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub use gmail::{FetchedEmail, GmailFetcher, MessageRef};
 
 /// Configuration for sync performance
-const DEFAULT_CONCURRENT_FETCHES: usize = 20;
+const DEFAULT_CONCURRENT_FETCHES: usize = 48;
 const MIN_CONCURRENT_FETCHES: usize = 4;
-const MAX_CONCURRENT_FETCHES: usize = 50;
+const MAX_CONCURRENT_FETCHES: usize = 64;
 const BATCH_INSERT_SIZE: usize = 50;
 
 /// Retry configuration for rate-limited fetches
@@ -30,7 +32,7 @@ const MAX_RETRY_ROUNDS: usize = 3;
 const RETRY_COOLDOWN_BASE_SECS: u64 = 15;
 const MIN_RETRY_CONCURRENCY: usize = 4;
 
-fn max_concurrent_fetches() -> usize {
+pub fn max_concurrent_fetches() -> usize {
     let value = env::var("WALMART_GMAIL_FETCH_CONCURRENCY")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -109,27 +111,6 @@ pub async fn sync_emails_with_days(
     Ok(stats)
 }
 
-/// Sync all Walmart emails (no date filter)
-pub async fn sync_emails(db: &Database, gmail_client: GmailClient) -> Result<SyncStats> {
-    let fetcher = GmailFetcher::new(gmail_client);
-    let mut stats = SyncStats::default();
-
-    tracing::info!("Fetching all Walmart emails from Gmail...");
-    let messages = fetcher.list_walmart_emails(None).await?;
-    stats.total_found = messages.len();
-
-    if messages.is_empty() {
-        tracing::info!("No Walmart emails found");
-        return Ok(stats);
-    }
-
-    tracing::info!("Found {} Walmart-related emails", messages.len());
-
-    process_messages(&fetcher, db, messages, &mut stats).await?;
-
-    Ok(stats)
-}
-
 /// Sync with a custom search query
 pub async fn sync_emails_with_query(
     db: &Database,
@@ -162,6 +143,7 @@ async fn fetch_emails_with_retries(
     fetcher: &GmailFetcher,
     ids_to_fetch: Vec<String>,
     initial_concurrency: usize,
+    rate_limit: Option<Arc<Semaphore>>,
     pb: &ProgressBar,
     stats: &mut SyncStats,
 ) -> Vec<FetchedEmail> {
@@ -190,10 +172,18 @@ async fn fetch_emails_with_retries(
 
         let fetch_results: Vec<Result<Option<FetchedEmail>, (String, anyhow::Error)>> =
             stream::iter(pending_ids.iter().cloned())
-                .map(|id| async move {
-                    match fetcher.fetch_email_full_with_retry(&id).await {
-                        Ok(email) => Ok(email),
-                        Err(e) => Err((id, e)),
+                .map(|id| {
+                    let rate_limit = rate_limit.clone();
+                    async move {
+                        // Acquire shared rate limit permit (if multi-account sync)
+                        let _permit = match &rate_limit {
+                            Some(sem) => Some(sem.acquire().await.expect("rate limit semaphore closed")),
+                            None => None,
+                        };
+                        match fetcher.fetch_email_full_with_retry(&id).await {
+                            Ok(email) => Ok(email),
+                            Err(e) => Err((id, e)),
+                        }
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -219,7 +209,7 @@ async fn fetch_emails_with_retries(
                         retryable_ids.push(id);
                     } else {
                         stats.failed += 1;
-                        tracing::warn!("Failed to fetch email {}: {}", id, err);
+                        tracing::warn!("Failed to fetch email {}: {:#}", id, err);
                     }
                 }
             }
@@ -293,7 +283,7 @@ async fn process_messages(
 
     let ids_to_fetch: Vec<String> = to_fetch.iter().map(|m| m.id.clone()).collect();
     let fetched_emails = fetch_emails_with_retries(
-        fetcher, ids_to_fetch, concurrency, &pb, stats,
+        fetcher, ids_to_fetch, concurrency, None, &pb, stats,
     ).await;
 
     // Step 3: Batch insert fetched emails
@@ -373,6 +363,7 @@ pub async fn sync_emails_with_days_and_account(
     gmail_client: GmailClient,
     days: u32,
     account_id: i64,
+    rate_limit: Option<Arc<Semaphore>>,
 ) -> Result<SyncStats> {
     let fetcher = GmailFetcher::new(gmail_client);
     let mut stats = SyncStats::default();
@@ -388,7 +379,7 @@ pub async fn sync_emails_with_days_and_account(
 
     tracing::info!("Found {} Walmart-related emails", messages.len());
 
-    process_messages_with_account(&fetcher, db, messages, &mut stats, account_id).await?;
+    process_messages_with_account(&fetcher, db, messages, &mut stats, account_id, rate_limit).await?;
 
     Ok(stats)
 }
@@ -399,6 +390,7 @@ pub async fn sync_emails_with_query_and_account(
     gmail_client: GmailClient,
     query: &str,
     account_id: i64,
+    rate_limit: Option<Arc<Semaphore>>,
 ) -> Result<SyncStats> {
     let fetcher = GmailFetcher::new(gmail_client);
     let mut stats = SyncStats::default();
@@ -412,7 +404,7 @@ pub async fn sync_emails_with_query_and_account(
         return Ok(stats);
     }
 
-    process_messages_with_account(&fetcher, db, messages, &mut stats, account_id).await?;
+    process_messages_with_account(&fetcher, db, messages, &mut stats, account_id, rate_limit).await?;
 
     Ok(stats)
 }
@@ -424,6 +416,7 @@ async fn process_messages_with_account(
     messages: Vec<MessageRef>,
     stats: &mut SyncStats,
     account_id: i64,
+    rate_limit: Option<Arc<Semaphore>>,
 ) -> Result<()> {
     let pb = ProgressBar::new(messages.len() as u64);
     pb.set_style(
@@ -472,7 +465,7 @@ async fn process_messages_with_account(
 
     let ids_to_fetch: Vec<String> = to_fetch.iter().map(|m| m.id.clone()).collect();
     let fetched_emails = fetch_emails_with_retries(
-        fetcher, ids_to_fetch, concurrency, &pb, stats,
+        fetcher, ids_to_fetch, concurrency, rate_limit, &pb, stats,
     ).await;
 
     // Step 3: Batch insert fetched emails

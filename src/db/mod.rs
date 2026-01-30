@@ -121,7 +121,7 @@ impl Database {
             ("008", include_str!("../../migrations/008_fix_shipped_date.sql")),
             ("009", include_str!("../../migrations/009_profile_picture.sql")),
             ("011", include_str!("../../migrations/011_clear_processed_bodies.sql")),
-        ];
+        ];  
 
         for (name, migration_sql) in data_migrations {
             self.execute_sql(migration_sql).await?;

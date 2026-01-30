@@ -12,8 +12,7 @@ use google_gmail1::{hyper, hyper_rustls, oauth2, Gmail};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Default paths for credential files
-pub const DEFAULT_CLIENT_SECRET_PATH: &str = "client_secret.json";
+/// Default path for token cache file
 pub const DEFAULT_TOKEN_CACHE_PATH: &str = "token_cache.json";
 
 /// Gmail API scopes we need
@@ -83,20 +82,6 @@ pub async fn get_gmail_client(
     let gmail = Gmail::new(client, auth);
 
     Ok(gmail)
-}
-
-/// Convenience function using default paths
-pub async fn authenticate() -> Result<GmailClient> {
-    get_gmail_client(
-        Path::new(DEFAULT_CLIENT_SECRET_PATH),
-        Path::new(DEFAULT_TOKEN_CACHE_PATH),
-    )
-    .await
-}
-
-/// Check if credentials are already cached
-pub fn has_cached_token() -> bool {
-    Path::new(DEFAULT_TOKEN_CACHE_PATH).exists()
 }
 
 /// Remove cached token (for re-authentication)

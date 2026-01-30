@@ -34,7 +34,7 @@ pub mod web;
 // Re-export core types
 pub use models::{ItemStatus, LineItem, OrderStatus, WalmartOrder};
 pub use parsing::WalmartEmailParser;
-pub use ingestion::{sync_emails, sync_emails_with_days, GmailFetcher, SyncStats};
+pub use ingestion::{sync_emails_with_days, GmailFetcher, SyncStats};
 pub use process::{process_pending_events, ProcessStats};
 
 // Re-export web module types for Tauri

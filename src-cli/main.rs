@@ -111,13 +111,6 @@ enum Commands {
         id: String,
     },
 
-    /// Check delivery status for shipped FedEx orders via carrier API
-    CheckDelivery {
-        /// Dry run - don't update database, just show what would be updated
-        #[arg(long)]
-        dry_run: bool,
-    },
-
     /// Fetch tracking status from 17track.net for shipped orders
     FetchTracking {
         /// Specific order ID to fetch tracking for
@@ -314,6 +307,7 @@ async fn main() -> Result<()> {
                                     gmail_client,
                                     custom_query,
                                     acc.id,
+                                    None,
                                 ).await?
                             } else {
                                 ingestion::sync_emails_with_days_and_account(
@@ -321,6 +315,7 @@ async fn main() -> Result<()> {
                                     gmail_client,
                                     days,
                                     acc.id,
+                                    None,
                                 ).await?
                             };
 
@@ -675,24 +670,6 @@ async fn main() -> Result<()> {
             } else {
                 println!("Order {} not found", id);
             }
-        }
-
-        Commands::CheckDelivery { dry_run: _ } => {
-            // FedEx tracking via API is no longer available due to Akamai Bot Manager protection.
-            // The Akamai sensor_data generation requires JavaScript execution which cannot be
-            // done programmatically without browser automation.
-            println!("FedEx delivery status checking is currently unavailable.");
-            println!();
-            println!("FedEx uses Akamai Bot Manager which requires browser-generated cookies.");
-            println!("To check delivery status, use one of these alternatives:");
-            println!("  1. Visit https://www.fedex.com/fedextrack/ in a browser");
-            println!("  2. Use browser automation (Playwright/Puppeteer)");
-            println!("  3. Use FedEx's official tracking API with an API key");
-            println!();
-            println!("The experimental Akamai code has been moved to src/tracking/akamai/");
-            println!("for reference, but it cannot generate valid sensor_data without JS execution.");
-            println!();
-            println!("TIP: Use 'fetch-tracking' command to get tracking status via 17track.net");
         }
 
         Commands::FetchTracking { order_id, force } => {

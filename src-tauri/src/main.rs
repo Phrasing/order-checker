@@ -214,7 +214,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard,
-            commands::refresh_dashboard,
             commands::get_db_path,
             commands::get_tracking_status,
             commands::fetch_tracking,
@@ -225,6 +224,8 @@ fn main() {
             commands::process_emails,
             commands::sync_and_process_orders,
             commands::check_new_emails,
+            commands::add_account,
+            commands::remove_account,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")

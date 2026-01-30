@@ -17,6 +17,13 @@ let fetchSinceDate = localStorage.getItem('fetchSinceDate') || null;
 let isSyncing = false;
 let currentRenderedOrders = [];
 let expandedOrderId = null;
+let lastUpdatedText = '';
+
+function updateLastUpdated(text) {
+    lastUpdatedText = text;
+    const el = document.getElementById('last-updated');
+    if (el) el.textContent = text;
+}
 
 // Status priority for sorting (lower = higher priority)
 const statusPriority = {
@@ -62,8 +69,6 @@ const trackingStateColors = {
 
 // Cache for tracking status
 const trackingCache = new Map();
-// Cache for image data URLs keyed by image_id
-const imageCache = new Map();
 // Cache for thumbnail data URLs keyed by image_id
 const thumbnailCache = new Map();
 let orderThumbObserver = null;
@@ -129,7 +134,8 @@ function renderSidebar(data) {
     document.getElementById('count-delivered').textContent = data.status_counts?.delivered || 0;
     document.getElementById('count-canceled').textContent = data.status_counts?.canceled || 0;
     document.getElementById('pending-emails').textContent = `${data.pending_emails || 0} pending emails`;
-    document.getElementById('last-updated').textContent = data.last_updated || '';
+    lastUpdatedText = data.last_updated || '';
+    document.getElementById('last-updated').textContent = lastUpdatedText;
 }
 
 /**
@@ -207,7 +213,6 @@ function renderAccountSelector(accounts) {
 
     select.style.display = 'block';
 
-    // Build options HTML
     const optionsHtml = `
         <option value="">All Accounts (${accounts.reduce((sum, a) => sum + a.order_count, 0)})</option>
         ${accounts.map(acc => {
@@ -217,7 +222,6 @@ function renderAccountSelector(accounts) {
             </option>`;
         }).join('')}
     `;
-
     select.innerHTML = optionsHtml;
 }
 
@@ -227,6 +231,83 @@ function renderAccountSelector(accounts) {
 window.handleAccountChange = async function(value) {
     currentAccountId = value ? parseInt(value) : null;
     await loadDashboard();
+};
+
+/**
+ * Account management modal
+ */
+window.openAccountModal = function() {
+    renderAccountModal();
+    document.getElementById('account-modal-overlay').style.display = 'flex';
+};
+
+window.closeAccountModal = function(event) {
+    if (event && event.target !== event.currentTarget) return;
+    document.getElementById('account-modal-overlay').style.display = 'none';
+};
+
+function renderAccountModal() {
+    const body = document.getElementById('account-modal-body');
+    const accounts = allAccounts;
+
+    let html = `<p class="modal-account-count">You currently have ${accounts.length} account${accounts.length !== 1 ? 's' : ''} connected.</p>`;
+
+    for (const acc of accounts) {
+        const shortEmail = acc.email.split('@')[0];
+        const avatarHtml = acc.profile_picture_url
+            ? `<img class="modal-account-avatar" src="${escapeHtml(acc.profile_picture_url)}" alt="" onerror="this.outerHTML='<div class=\\'modal-account-avatar-fallback\\'>${escapeHtml(acc.email.charAt(0).toUpperCase())}</div>'">`
+            : `<div class="modal-account-avatar-fallback">${escapeHtml(acc.email.charAt(0).toUpperCase())}</div>`;
+
+        html += `
+        <div class="modal-account-card">
+            ${avatarHtml}
+            <div class="modal-account-info">
+                <div class="modal-account-name">${escapeHtml(shortEmail)}</div>
+                <div class="modal-account-email">${escapeHtml(acc.email)}</div>
+            </div>
+            <button class="modal-disconnect-btn" onclick="disconnectAccount(${acc.id})">Disconnect</button>
+        </div>`;
+    }
+
+    html += `<button class="modal-connect-btn" onclick="connectAccount()">+ Connect Gmail Account</button>`;
+    body.innerHTML = html;
+}
+
+window.connectAccount = async function() {
+    try {
+        const email = await invoke('add_account');
+        console.log('Added account:', email);
+        currentAccountId = null;
+        await loadDashboard();
+        renderAccountModal();
+    } catch (e) {
+        console.error('Failed to add account:', e);
+        alert('Failed to add account: ' + e);
+    }
+};
+
+window.disconnectAccount = async function(accountId) {
+    const account = allAccounts.find(a => a.id === accountId);
+    if (!account) return;
+
+    if (!confirm(`Disconnect ${account.email}?\n\nThis will delete all synced emails and orders for this account.`)) {
+        return;
+    }
+
+    try {
+        const result = await invoke('remove_account', { accountId });
+        console.log('Removed account:', result);
+        currentAccountId = null;
+        await loadDashboard();
+        if (allAccounts.length === 0) {
+            closeAccountModal();
+        } else {
+            renderAccountModal();
+        }
+    } catch (e) {
+        console.error('Failed to remove account:', e);
+        alert('Failed to remove account: ' + e);
+    }
 };
 
 /**
@@ -320,14 +401,31 @@ function searchOrders(orders, query) {
     return orders.filter(order =>
         order.id.toLowerCase().includes(q) ||
         order.status.toLowerCase().includes(q) ||
+        (order.total_cost && order.total_cost.includes(q)) ||
         (order.items || []).some(item => item.name.toLowerCase().includes(q))
     );
 }
 
 function applyFiltersAndRender() {
-    const filtered = searchOrders(filterOrders(allOrders, currentFilter), currentSearchQuery);
+    const statusFiltered = filterOrders(allOrders, currentFilter);
+    const filtered = searchOrders(statusFiltered, currentSearchQuery);
     currentRenderedOrders = filtered;
     renderOrders(filtered);
+    updateResultsCount(filtered.length, statusFiltered.length);
+}
+
+function updateResultsCount(shown, total) {
+    const subtitle = document.getElementById('last-updated');
+    if (!currentSearchQuery) {
+        subtitle.textContent = lastUpdatedText;
+        return;
+    }
+    const filterLabel = currentFilter === 'all' ? 'orders' : `${currentFilter} orders`;
+    if (shown === 0) {
+        subtitle.textContent = `No ${filterLabel} match "${currentSearchQuery}"`;
+    } else {
+        subtitle.textContent = `${shown} of ${total} ${filterLabel} match "${currentSearchQuery}"`;
+    }
 }
 
 /**
@@ -359,26 +457,6 @@ function sortOrders(orders, sortBy) {
         // Use raw ISO date for reliable comparison (order_date is formatted for display)
         return new Date(b.order_date_raw) - new Date(a.order_date_raw);
     });
-}
-
-/**
- * Toggle sort mode between date and status
- */
-window.toggleSort = function() {
-    currentSort = currentSort === 'date' ? 'status' : 'date';
-    updateSortButton();
-    applyFiltersAndRender();
-};
-
-/**
- * Update sort button text and state
- */
-function updateSortButton() {
-    const btn = document.getElementById('sort-toggle');
-    if (btn) {
-        btn.textContent = currentSort === 'date' ? 'Sort: Date' : 'Sort: Status';
-        btn.classList.toggle('active', currentSort === 'status');
-    }
 }
 
 /**
@@ -784,20 +862,6 @@ async function loadOrderImages(orderId) {
     await loadThumbnailsForElements(Array.from(images));
 }
 
-async function fetchCachedImage(imageId, fallbackUrl) {
-    try {
-        const result = await invoke('get_cached_image', { imageId });
-        if (!result || !result.data_url) {
-            return fallbackUrl || null;
-        }
-        imageCache.set(imageId, result.data_url);
-        return result.data_url;
-    } catch (error) {
-        console.warn('Failed to fetch cached image', imageId, error);
-        return fallbackUrl || null;
-    }
-}
-
 async function fetchCachedThumbnails(imageIds) {
     const unique = imageIds.filter(id => id && !thumbnailCache.has(id));
     if (unique.length === 0) {
@@ -960,6 +1024,7 @@ function setupFetchSincePicker() {
             localStorage.removeItem('fetchSinceDate');
         }
         updateFetchSinceHint(hint, fetchSinceDate);
+        checkForNewEmails();
     });
 }
 

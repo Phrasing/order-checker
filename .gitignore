@@ -36,6 +36,9 @@ NUL
 debug_output.txt
 price_debug*.txt
 
+# Test artifacts
+rembg-test-*
+
 # Logs (can grow very large)
 logs/
 

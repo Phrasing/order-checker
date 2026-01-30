@@ -2,6 +2,7 @@
 //!
 //! These commands are called from the frontend JavaScript via tauri.invoke()
 
+use futures::future;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,8 +10,9 @@ use std::sync::Arc;
 use tauri::State;
 use base64::Engine;
 use sqlx::Row;
-use walmart_dashboard::auth::{AccountAuth, get_gmail_client_for_account, fetch_profile_picture_url};
+use walmart_dashboard::auth::{self, AccountAuth, get_gmail_client_for_account, fetch_profile_picture_url};
 use walmart_dashboard::db::Database;
+use tokio::sync::Semaphore;
 use walmart_dashboard::ingestion;
 use walmart_dashboard::process;
 use walmart_dashboard::tracking::{self, TrackingService};
@@ -44,17 +46,6 @@ pub async fn get_dashboard(
     )
     .await
     .map_err(|e| e.to_string())
-}
-
-/// Refresh dashboard data (same as get_dashboard, provided for semantic clarity)
-#[tauri::command]
-pub async fn refresh_dashboard(
-    state: State<'_, AppState>,
-    account_id: Option<i64>,
-    start_date: Option<String>,
-    end_date: Option<String>,
-) -> Result<DashboardData, String> {
-    get_dashboard(state, account_id, start_date, end_date).await
 }
 
 /// List all configured accounts
@@ -301,108 +292,155 @@ async fn perform_sync_and_process(
         });
     }
 
-    // Sync each account
-    for acc in &accounts {
-        if !acc.is_active {
-            continue;
-        }
+    // Pre-warm tracking client (launches Chrome) concurrently with email sync.
+    // This overlaps the ~3-5s Chrome startup with the email fetch stage.
+    let tracking_warmup = {
+        let ts = tracking_service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ts.ensure_initialized().await {
+                tracing::warn!("Tracking pre-warm failed (will retry lazily): {}", e);
+            }
+        })
+    };
 
-        tracing::info!(email = %acc.email, "Syncing emails for account");
+    // Sync all active accounts in parallel — each account hits a different
+    // Gmail mailbox with its own OAuth token, so there's no shared resource conflict.
+    // SQLite WAL mode handles concurrent writes.
+    // A shared semaphore caps total in-flight Gmail requests across ALL accounts
+    // to avoid rate-limit storms when multiple accounts sync concurrently.
+    let active_accounts: Vec<_> = accounts.iter().filter(|a| a.is_active).collect();
+    let rate_limit = Arc::new(Semaphore::new(ingestion::max_concurrent_fetches()));
 
-        // Resolve token cache path relative to the database directory
-        // (tokens are created by CLI in the project root alongside orders.db)
-        let token_path = PathBuf::from(&acc.token_cache_path);
-        let resolved_token_path = if token_path.is_absolute() {
-            token_path
-        } else {
-            base_dir.join(token_path)
-        };
+    let sync_futures: Vec<_> = active_accounts
+        .iter()
+        .map(|acc| {
+            let db = db.clone();
+            let base_dir = base_dir.to_path_buf();
+            let client_secret_path = client_secret_path.clone();
+            let fetch_since = fetch_since.clone();
+            let email = acc.email.clone();
+            let acc_id = acc.id;
+            let token_cache_path = acc.token_cache_path.clone();
+            let rate_limit = Some(Arc::clone(&rate_limit));
 
-        tracing::debug!(
-            email = %acc.email,
-            token_path = %resolved_token_path.display(),
-            "Resolved token cache path"
-        );
+            async move {
+                tracing::info!(email = %email, "Syncing emails for account");
 
-        // Create AccountAuth from resolved token path
-        let account_auth = AccountAuth::with_path(
-            &acc.email,
-            resolved_token_path,
-        );
-
-        // Get Gmail client for this account
-        match get_gmail_client_for_account(&client_secret_path, &account_auth).await {
-            Ok(gmail_client) => {
-                // Sync emails: use user-specified date or default to last 5 days
-                let sync_result = match &fetch_since {
-                    Some(since_date) => {
-                        let query = ingestion::gmail::build_walmart_query_since(since_date);
-                        ingestion::sync_emails_with_query_and_account(
-                            &db, gmail_client, &query, acc.id,
-                        ).await
-                    }
-                    None => {
-                        ingestion::sync_emails_with_days_and_account(
-                            &db, gmail_client, 5, acc.id,
-                        ).await
-                    }
+                let token_path = PathBuf::from(&token_cache_path);
+                let resolved_token_path = if token_path.is_absolute() {
+                    token_path
+                } else {
+                    base_dir.join(token_path)
                 };
-                match sync_result {
-                    Ok(stats) => {
-                        total_synced += stats.synced;
-                        tracing::info!(
-                            email = %acc.email,
-                            synced = stats.synced,
-                            skipped = stats.skipped,
-                            "Sync completed for account"
-                        );
 
-                        // Update last_sync_at timestamp
-                        if let Err(e) = db.update_account_last_sync(acc.id).await {
-                            tracing::warn!(email = %acc.email, error = %e, "Failed to update last_sync_at");
-                        }
+                tracing::debug!(
+                    email = %email,
+                    token_path = %resolved_token_path.display(),
+                    "Resolved token cache path"
+                );
 
-                        // Refresh profile picture URL
-                        match fetch_profile_picture_url(&client_secret_path, &account_auth).await {
-                            Ok(pic_url) => {
-                                if let Err(e) = db.update_account_profile_picture(acc.id, pic_url.as_deref()).await {
-                                    tracing::warn!(email = %acc.email, error = %e, "Failed to save profile picture URL");
+                let account_auth = AccountAuth::with_path(&email, resolved_token_path);
+
+                match get_gmail_client_for_account(&client_secret_path, &account_auth).await {
+                    Ok(gmail_client) => {
+                        let sync_result = match &fetch_since {
+                            Some(since_date) => {
+                                let query = ingestion::gmail::build_walmart_query_since(since_date);
+                                ingestion::sync_emails_with_query_and_account(
+                                    &db, gmail_client, &query, acc_id, rate_limit.clone(),
+                                ).await
+                            }
+                            None => {
+                                ingestion::sync_emails_with_days_and_account(
+                                    &db, gmail_client, 5, acc_id, rate_limit.clone(),
+                                ).await
+                            }
+                        };
+                        match sync_result {
+                            Ok(stats) => {
+                                tracing::info!(
+                                    email = %email,
+                                    synced = stats.synced,
+                                    skipped = stats.skipped,
+                                    "Sync completed for account"
+                                );
+                                if let Err(e) = db.update_account_last_sync(acc_id).await {
+                                    tracing::warn!(email = %email, error = %e, "Failed to update last_sync_at");
                                 }
+                                match fetch_profile_picture_url(&client_secret_path, &account_auth).await {
+                                    Ok(pic_url) => {
+                                        if let Err(e) = db.update_account_profile_picture(acc_id, pic_url.as_deref()).await {
+                                            tracing::warn!(email = %email, error = %e, "Failed to save profile picture URL");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(email = %email, error = %e, "Failed to fetch profile picture");
+                                    }
+                                }
+                                Ok(stats.synced)
                             }
                             Err(e) => {
-                                tracing::warn!(email = %acc.email, error = %e, "Failed to fetch profile picture");
+                                let err_msg = format!("Sync failed for {}: {}", email, e);
+                                tracing::error!("{}", err_msg);
+                                Err(err_msg)
                             }
                         }
                     }
                     Err(e) => {
-                        let err_msg = format!("Sync failed for {}: {}", acc.email, e);
+                        let err_msg = format!("Auth failed for {}: {}", email, e);
                         tracing::error!("{}", err_msg);
-                        errors.push(err_msg);
+                        Err(err_msg)
                     }
                 }
             }
-            Err(e) => {
-                let err_msg = format!("Auth failed for {}: {}", acc.email, e);
-                tracing::error!("{}", err_msg);
-                errors.push(err_msg);
-            }
+        })
+        .collect();
+
+    let sync_results = future::join_all(sync_futures).await;
+    for result in sync_results {
+        match result {
+            Ok(synced) => total_synced += synced,
+            Err(err_msg) => errors.push(err_msg),
         }
     }
 
-    // Process all pending emails into orders
+    // Process all pending emails into orders (must complete before image/tracking)
     let process_stats = process::process_pending_events(&db)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Fetch tracking info for any orders that are missing it
-    if let Err(e) = tracking::fetch_missing_tracking_batch(&db, &tracking_service).await {
+    // Ensure tracking client pre-warm has completed before tracking stage
+    let _ = tracking_warmup.await;
+
+    // Run image processing and tracking fetch concurrently — these are independent
+    // I/O-bound stages that don't conflict: images hit the rembg server while
+    // tracking hits the 17track API.
+    let db_img = db.clone();
+    let db_track = db.clone();
+    let db_delivered = db.clone();
+    let ts = tracking_service.clone();
+
+    let (img_result, tracking_result, delivered_result) = tokio::join!(
+        async move {
+            process::process_missing_product_images(&db_img).await
+        },
+        async move {
+            tracking::fetch_missing_tracking_batch(&db_track, &ts).await
+        },
+        async move {
+            tracking::sync_delivered_from_tracking(&db_delivered).await
+        },
+    );
+
+    if let Err(e) = img_result {
+        tracing::warn!("Failed to process product images: {}", e);
+    }
+    if let Err(e) = tracking_result {
         let err_msg = format!("Tracking fetch failed: {}", e);
         tracing::error!("{}", err_msg);
         errors.push(err_msg);
     }
-
-    // Sync order statuses from tracking data (e.g. shipped -> delivered)
-    if let Err(e) = tracking::sync_delivered_from_tracking(&db).await {
+    if let Err(e) = delivered_result {
         tracing::warn!("Failed to sync delivered orders from tracking: {}", e);
     }
 
@@ -565,4 +603,83 @@ pub async fn check_new_emails(
     });
 
     rx.await.map_err(|_| "Email check task failed".to_string())?
+}
+
+/// Add a new Gmail account via OAuth flow.
+/// Opens a browser for the user to authorize, then stores the account in the DB.
+#[tauri::command]
+pub async fn add_account(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let db = Arc::clone(&state.db);
+    let client_secret_path = state.client_secret_path.clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(async {
+                let (email, token_path) = auth::authenticate_new_account(&client_secret_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Check if account already exists
+                if let Some(existing) = db.get_account_by_email(&email).await.map_err(|e| e.to_string())? {
+                    if existing.is_active {
+                        return Ok(email);
+                    }
+                    // Reactivate deactivated account
+                    sqlx::query("UPDATE accounts SET is_active = 1, token_cache_path = ? WHERE email = ?")
+                        .bind(token_path.to_string_lossy().to_string())
+                        .bind(&email)
+                        .execute(db.pool())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(email);
+                }
+
+                let token_path_str = token_path.to_string_lossy().to_string();
+                db.add_account(&email, &token_path_str).await.map_err(|e| e.to_string())?;
+
+                // Fetch and store profile picture
+                let account_auth = AccountAuth::with_path(&email, token_path);
+                if let Ok(Some(pic_url)) = fetch_profile_picture_url(&client_secret_path, &account_auth).await {
+                    if let Ok(Some(acc)) = db.get_account_by_email(&email).await {
+                        let _ = db.update_account_profile_picture(acc.id, Some(&pic_url)).await;
+                    }
+                }
+
+                Ok(email)
+            }),
+            Err(e) => Err(format!("Failed to create runtime: {}", e)),
+        };
+        let _ = tx.send(result);
+    });
+
+    rx.await.map_err(|_| "Add account task failed".to_string())?
+}
+
+/// Remove a Gmail account and delete all its data (orders, emails, token cache).
+#[tauri::command]
+pub async fn remove_account(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> Result<String, String> {
+    let db = &state.db;
+
+    let account = db.get_account_by_id(account_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Account not found".to_string())?;
+
+    let (orders, emails) = db.delete_account_data(account_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Delete token cache file
+    let token_path = std::path::Path::new(&account.token_cache_path);
+    if token_path.exists() {
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    Ok(format!("Removed {} ({} orders, {} emails deleted)", account.email, orders, emails))
 }

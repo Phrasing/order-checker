@@ -131,7 +131,7 @@ impl GmailFetcher {
                             tracing::warn!(
                                 attempt = attempt + 1,
                                 delay_ms = delay.as_millis() as u64,
-                                error = %err,
+                                error = format!("{:#}", err),
                                 "Transient Gmail list error, retrying"
                             );
                             had_retries = true;
@@ -302,7 +302,7 @@ impl GmailFetcher {
                             message_id = %message_id,
                             attempt = attempt + 1,
                             delay_ms = delay.as_millis() as u64,
-                            error = %err,
+                            error = format!("{:#}", err),
                             "Transient Gmail fetch error, retrying"
                         );
                         sleep(delay).await;
@@ -409,10 +409,13 @@ pub fn is_retryable_email_error(error: &anyhow::Error) -> bool {
         }
     }
 
-    let msg = error.to_string().to_lowercase();
+    // Use alternate Display ({:#}) to include the full error chain in the string search,
+    // not just the outermost context message
+    let msg = format!("{:#}", error).to_lowercase();
     msg.contains("timeout")
         || msg.contains("temporarily")
         || msg.contains("rate")
+        || msg.contains("too many")
         || msg.contains("unavailable")
 }
 

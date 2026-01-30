@@ -141,12 +141,6 @@ pub enum ParseError {
 
     #[error("Failed to parse date: {0}")]
     DateParseError(String),
-
-    #[error("No items found in email")]
-    NoItemsFound,
-
-    #[error("Invalid HTML structure")]
-    InvalidHtml,
 }
 
 /// Result type for parsing operations

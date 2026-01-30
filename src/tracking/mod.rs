@@ -213,6 +213,21 @@ impl TrackingService {
         self.client.lock().await.is_some()
     }
 
+    /// Pre-initialize the Track17 client (launches Chrome to extract credentials).
+    /// Call this during sync to overlap Chrome startup with email fetching.
+    pub async fn ensure_initialized(&self) -> Result<()> {
+        let mut client_guard = self.client.lock().await;
+        if client_guard.is_none() {
+            tracing::info!("Pre-warming Track17 client (launching Chrome)...");
+            let client = Track17Client::new()
+                .await
+                .context("Failed to initialize Track17 client. Ensure Chrome/Chromium is installed.")?;
+            *client_guard = Some(client);
+            tracing::info!("Track17 client pre-warmed successfully");
+        }
+        Ok(())
+    }
+
     /// Get tracking status with automatic credential recovery on failure.
     /// If tracking fails with credential-related errors, clears credentials and retries.
     /// Note: Chrome is only launched briefly during credential extraction.
@@ -471,7 +486,7 @@ impl TrackingService {
     }
 }
 
-/// Get cached tracking from database
+/// Get cached tracking from database   
 pub async fn get_cached_tracking(db: &Database, tracking_number: &str) -> Result<Option<CachedTracking>> {
     let row = sqlx::query(
         r#"

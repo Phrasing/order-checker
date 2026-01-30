@@ -104,6 +104,11 @@ impl ImageProcessor {
         })
     }
 
+    /// Upgrade semaphore concurrency for HTTP rembg mode (network-bound, not CPU-bound).
+    fn upgrade_concurrency_for_http(&mut self) {
+        self.semaphore = Arc::new(Semaphore::new(16));
+    }
+
     /// Create a processor that uses the rembg HTTP server for background removal.
     pub async fn new_rembg_http(
         pool: SqlitePool,
@@ -111,18 +116,13 @@ impl ImageProcessor {
     ) -> Result<Self> {
         let mut processor = Self::new(pool, Arc::new(NoopRemover)).await?;
         processor.rembg_endpoint = Some(normalize_rembg_endpoint(endpoint.into()));
+        processor.upgrade_concurrency_for_http();
         Ok(processor)
     }
 
     /// Create a processor that uses the default rembg HTTP endpoint.
     pub async fn new_rembg_http_default(pool: SqlitePool) -> Result<Self> {
         Self::new_rembg_http(pool, DEFAULT_REMBG_ENDPOINT).await
-    }
-
-    /// Enable rembg HTTP server usage on an existing processor.
-    pub fn with_rembg_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.rembg_endpoint = Some(normalize_rembg_endpoint(endpoint.into()));
-        self
     }
 
     /// Process a batch of URLs with bounded concurrency.

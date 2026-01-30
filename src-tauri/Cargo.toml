@@ -22,6 +22,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 dirs = "5"
 
+# Async utilities
+futures = "0.3"
+
 # Reference the core library
 walmart-dashboard = { path = ".." }
 

@@ -25,11 +25,7 @@ struct PendingTrackingEntry {
 const MAX_CONCURRENT_PARSING: usize = 50;
 
 /// Number of emails to process in a single batch (limits memory usage and lock duration)
-const BATCH_SIZE: i64 = 100;
-
-/// Maximum concurrent database write tasks (unused - now using single transaction)
-#[allow(dead_code)]
-const MAX_CONCURRENT_DB_WRITES: usize = 1;
+const BATCH_SIZE: i64 = 500;
 
 /// Statistics from processing operation
 #[derive(Debug, Default)]
@@ -225,10 +221,6 @@ pub async fn process_pending_events(db: &Database) -> Result<ProcessStats> {
     {
         Ok((order_count,)) => tracing::info!("Orders in database after processing: {}", order_count),
         Err(err) => tracing::error!("Failed to count orders after processing: {}", err),
-    }
-
-    if let Err(e) = process_missing_product_images(db).await {
-        tracing::warn!("Failed to process product images: {}", e);
     }
 
     Ok(total_stats)
@@ -528,93 +520,10 @@ async fn apply_delivery_tx<'a>(
 // ============================================================================
 
 
-/// Batch update item statuses for multiple items in one query
-async fn batch_update_item_status(
-    db: &Database,
-    order_id: &str,
-    item_names: &[&str],
-    status: ItemStatus,
-) -> Result<()> {
-    if item_names.is_empty() {
-        return Ok(());
-    }
-
-    let placeholders: Vec<&str> = item_names.iter().map(|_| "?").collect();
-    let query = format!(
-        "UPDATE line_items SET status = ? WHERE order_id = ? AND name IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut q = sqlx::query(&query)
-        .bind(status.as_str())
-        .bind(order_id);
-    for name in item_names {
-        q = q.bind(*name);
-    }
-    q.execute(db.pool()).await?;
-    Ok(())
-}
-
-/// Batch cancel items by name in one query
-async fn batch_cancel_items_by_name(
-    db: &Database,
-    order_id: &str,
-    item_names: &[&str],
-) -> Result<()> {
-    if item_names.is_empty() {
-        return Ok(());
-    }
-
-    let placeholders: Vec<&str> = item_names.iter().map(|_| "?").collect();
-    let query = format!(
-        "UPDATE line_items SET status = 'canceled' WHERE order_id = ? AND name IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut q = sqlx::query(&query).bind(order_id);
-    for name in item_names {
-        q = q.bind(*name);
-    }
-    q.execute(db.pool()).await?;
-    Ok(())
-}
-
-async fn check_all_items_canceled(db: &Database, order_id: &str) -> Result<bool> {
-    let non_canceled: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM line_items WHERE order_id = ? AND status != 'canceled'"
-    )
-    .bind(order_id)
-    .fetch_one(db.pool())
-    .await?;
-
-    Ok(non_canceled.0 == 0)
-}
-
-async fn record_email_event(
-    db: &Database,
-    order_id: &str,
-    event_type: &str,
-    email: &RawEmail,
-) -> Result<()> {
-    // Note: raw_html is NULL because it's already stored in raw_emails table
-    // Storing it again would be redundant and slow (50-150KB per email)
-    sqlx::query(
-        r#"
-        INSERT INTO email_events (order_id, event_type, email_subject, email_date, raw_html)
-        VALUES (?, ?, ?, ?, NULL)
-        "#
-    )
-    .bind(order_id)
-    .bind(event_type)
-    .bind(&email.subject)
-    .bind(&email.gmail_date)
-    .execute(db.pool())
-    .await?;
-    Ok(())
-}
-
 /// Process missing product images via rembg server and cache the results.
-async fn process_missing_product_images(db: &Database) -> Result<()> {
+/// Process product images that haven't been downloaded/cached yet.
+/// Separated from `process_pending_events` to allow concurrent execution with tracking.
+pub async fn process_missing_product_images(db: &Database) -> Result<()> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT image_url FROM line_items WHERE image_url IS NOT NULL AND image_url != ''"
     )
@@ -1051,37 +960,6 @@ async fn record_email_event_tx<'a>(
     Ok(())
 }
 
-async fn mark_email_processed(db: &Database, email_id: i64, _error: Option<&str>) -> Result<()> {
-    sqlx::query(
-        "UPDATE raw_emails SET processing_status = 'processed', processed_at = datetime('now') WHERE id = ?"
-    )
-    .bind(email_id)
-    .execute(db.pool())
-    .await?;
-    Ok(())
-}
-
-async fn mark_email_failed(db: &Database, email_id: i64, error: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE raw_emails SET processing_status = 'failed', error_message = ?, processed_at = datetime('now') WHERE id = ?"
-    )
-    .bind(error)
-    .bind(email_id)
-    .execute(db.pool())
-    .await?;
-    Ok(())
-}
-
-async fn mark_email_skipped(db: &Database, email_id: i64) -> Result<()> {
-    sqlx::query(
-        "UPDATE raw_emails SET processing_status = 'skipped', processed_at = datetime('now') WHERE id = ?"
-    )
-    .bind(email_id)
-    .execute(db.pool())
-    .await?;
-    Ok(())
-}
-
 // ============================================================================
 // Batch status update functions for performance
 // ============================================================================
@@ -1158,7 +1036,6 @@ async fn batch_mark_emails_failed(db: &Database, entries: &[(i64, String)]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::OrderStatus;
 
     #[test]
     fn test_normalize_item_name_variants() {
