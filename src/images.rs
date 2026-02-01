@@ -163,9 +163,11 @@ impl ImageProcessor {
             return Ok(cached);
         }
 
+        // Download at reduced resolution when possible (saves bandwidth + faster rembg)
+        let download_url = optimize_image_download_url(url);
         let response = self
             .client
-            .get(url)
+            .get(download_url.as_str())
             .send()
             .await
             .with_context(|| format!("Failed to download image: {url}"))?
@@ -478,6 +480,18 @@ fn generate_thumbnail(bytes: &[u8]) -> Result<Thumbnail> {
         width,
         height,
     })
+}
+
+/// Request a smaller image from Walmart CDN when the URL supports it.
+/// The thumbnail is 112×112 so 300px is plenty for rembg + thumbnail generation.
+/// The image cache ID is computed from the *original* URL so caching is unaffected.
+fn optimize_image_download_url(url: &str) -> String {
+    if url.contains("walmartimages.com") && !url.contains("odnWidth") {
+        let sep = if url.contains('?') { "&" } else { "?" };
+        format!("{url}{sep}odnWidth=300&odnHeight=300&odnBg=FFFFFF")
+    } else {
+        url.to_string()
+    }
 }
 
 fn fallback_result(

@@ -10,10 +10,57 @@ use google_gmail1::hyper::client::HttpConnector;
 use google_gmail1::hyper_rustls::HttpsConnector;
 use google_gmail1::{hyper, hyper_rustls, oauth2, Gmail};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 /// Default path for token cache file
 pub const DEFAULT_TOKEN_CACHE_PATH: &str = "token_cache.json";
+
+/// Custom OAuth flow delegate that calls a callback with the auth URL
+/// instead of printing to stdout or opening the browser directly.
+/// Used by the Tauri app to open the URL via the system browser plugin
+/// and show an in-app auth overlay.
+pub struct CallbackFlowDelegate<F: Fn(&str) + Send + Sync> {
+    on_url: F,
+}
+
+impl<F: Fn(&str) + Send + Sync> CallbackFlowDelegate<F> {
+    pub fn new(on_url: F) -> Self {
+        Self { on_url }
+    }
+}
+
+impl<F: Fn(&str) + Send + Sync> oauth2::authenticator_delegate::InstalledFlowDelegate
+    for CallbackFlowDelegate<F>
+{
+    fn present_user_url<'a>(
+        &'a self,
+        url: &'a str,
+        _need_code: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        (self.on_url)(url);
+        Box::pin(async { Ok(String::new()) })
+    }
+}
+
+/// Non-interactive delegate that fails immediately if browser auth is needed.
+/// Used by `get_gmail_client_for_account` to prevent sync from hanging when a
+/// token is expired/revoked. Silent token refresh still works — only interactive
+/// OAuth (browser redirect) is blocked.
+pub struct NonInteractiveFlowDelegate;
+
+impl oauth2::authenticator_delegate::InstalledFlowDelegate for NonInteractiveFlowDelegate {
+    fn present_user_url<'a>(
+        &'a self,
+        _url: &'a str,
+        _need_code: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async {
+            Err("Token expired or revoked. Please re-connect this account.".to_string())
+        })
+    }
+}
 
 /// Gmail API scopes we need
 const GMAIL_SCOPES: &[&str] = &[
@@ -165,12 +212,15 @@ pub async fn get_gmail_client_for_account(
         .await
         .context("Failed to read client_secret.json. Make sure the file exists and is valid.")?;
 
-    // Build the authenticator with token persistence for this specific account
+    // Build the authenticator with token persistence for this specific account.
+    // Uses NonInteractiveFlowDelegate so that expired/revoked tokens fail fast
+    // instead of blocking forever waiting for browser auth.
     let auth = oauth2::InstalledFlowAuthenticator::builder(
         secret,
         oauth2::InstalledFlowReturnMethod::HTTPRedirect,
     )
     .persist_tokens_to_disk(&account_auth.token_cache_path)
+    .flow_delegate(Box::new(NonInteractiveFlowDelegate))
     .build()
     .await
     .context("Failed to build authenticator")?;
@@ -217,13 +267,23 @@ pub async fn get_authenticated_email(client: &GmailClient) -> Result<String> {
 
 /// Authenticate with a new account (triggers OAuth flow) and return the email.
 /// This is used during the add-account flow to discover the email address.
+///
+/// When `flow_delegate` is `Some`, the delegate controls how the auth URL is
+/// presented (e.g. via Tauri's opener plugin). When `None`, the default
+/// yup-oauth2 delegate opens the system browser / prints to stdout.
 pub async fn authenticate_new_account(
     client_secret_path: &Path,
+    flow_delegate: Option<Box<dyn oauth2::authenticator_delegate::InstalledFlowDelegate>>,
+    token_dir: &Path,
 ) -> Result<(String, PathBuf)> {
     tracing::info!("Starting OAuth flow for new account...");
 
-    // Use a temporary token path first
-    let temp_path = PathBuf::from("token_cache_temp.json");
+    // Ensure token directory exists
+    std::fs::create_dir_all(token_dir)
+        .context("Failed to create token directory")?;
+
+    // Use a temporary token path inside token_dir
+    let temp_path = token_dir.join("token_cache_temp.json");
 
     // Read the client secret file
     let secret = oauth2::read_application_secret(client_secret_path)
@@ -231,11 +291,17 @@ pub async fn authenticate_new_account(
         .context("Failed to read client_secret.json")?;
 
     // Build the authenticator
-    let auth = oauth2::InstalledFlowAuthenticator::builder(
+    let mut builder = oauth2::InstalledFlowAuthenticator::builder(
         secret.clone(),
         oauth2::InstalledFlowReturnMethod::HTTPRedirect,
     )
-    .persist_tokens_to_disk(&temp_path)
+    .persist_tokens_to_disk(&temp_path);
+
+    if let Some(delegate) = flow_delegate {
+        builder = builder.flow_delegate(delegate);
+    }
+
+    let auth = builder
     .build()
     .await
     .context("Failed to build authenticator")?;
@@ -261,8 +327,8 @@ pub async fn authenticate_new_account(
     let email = get_authenticated_email(&gmail).await?;
     tracing::info!(email = %email, "Authenticated as");
 
-    // Generate the permanent token path
-    let permanent_path = AccountAuth::generate_token_path(&email);
+    // Generate the permanent token path inside token_dir
+    let permanent_path = token_dir.join(AccountAuth::generate_token_path(&email));
 
     // Rename temp token to permanent path
     if temp_path.exists() {

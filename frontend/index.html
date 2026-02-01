@@ -7,1095 +7,180 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles/tailwind.css">
-    <style>
-        :root {
-            --bg-primary: #1c1c1e;
-            --bg-secondary: #2c2c2e;
-            --bg-tertiary: #3a3a3c;
-            --bg-hover: #48484a;
-            --text-primary: #f5f5f7;
-            --text-secondary: #98989d;
-            --text-tertiary: #636366;
-            --border-color: #38383a;
-            --accent-blue: #0a84ff;
-            --accent-green: #30d158;
-            --accent-orange: #ff9f0a;
-            --accent-red: #ff453a;
-            --accent-purple: #bf5af2;
-        }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            background-color: var(--bg-primary);
-            color: var(--text-primary);
-            font-family: "Roboto", sans-serif;
-            font-optical-sizing: auto;
-            font-variation-settings: "wdth" 100;
-            margin: 0;
-            height: 100vh;
-            overflow: hidden;
-            /* Let Windows use native ClearType rendering for sharper fonts */
-            -webkit-font-smoothing: auto;
-            text-rendering: optimizeLegibility;
-            font-feature-settings: "kern" 1;
-        }
-
-        .app-container {
-            display: grid;
-            grid-template-columns: 220px 1fr;
-            height: 100vh;
-        }
-
-        /* Sidebar */
-        .sidebar {
-            background-color: rgba(44, 44, 46, 0.8);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border-right: 1px solid var(--border-color);
-            padding: 16px 12px;
-            display: flex;
-            flex-direction: column;
-            overflow-y: auto;
-        }
-
-        .sidebar-header {
-            padding: 8px 8px 16px;
-            border-bottom: 1px solid var(--border-color);
-            margin-bottom: 16px;
-        }
-
-        .sidebar-title {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-secondary);
-            margin-bottom: 4px;
-        }
-
-        .sidebar-count {
-            font-size: 28px;
-            font-weight: 300;
-            color: var(--text-primary);
-        }
-
-        .filter-section {
-            margin-bottom: 24px;
-        }
-
-        .filter-label {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: var(--text-tertiary);
-            padding: 0 8px;
-            margin-bottom: 8px;
-        }
-
-        .filter-item {
-            display: flex;
-            align-items: center;
-            padding: 8px 10px;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: background-color 0.15s;
-            font-size: 13px;
-            color: var(--text-primary);
-        }
-
-        .filter-item:hover {
-            background-color: var(--bg-tertiary);
-        }
-
-        .filter-item.active {
-            background-color: var(--accent-blue);
-        }
-
-        .filter-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            margin-right: 10px;
-        }
-
-        .filter-count {
-            margin-left: auto;
-            font-size: 12px;
-            color: var(--text-secondary);
-            font-weight: 500;
-        }
-
-        .filter-item.active .filter-count {
-            color: rgba(255,255,255,0.8);
-        }
-
-        /* Stats section */
-        .stats-section {
-            margin-top: 16px;
-            padding-top: 16px;
-            border-top: 1px solid var(--border-color);
-        }
-
-        .stat-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 6px 10px;
-            font-size: 12px;
-        }
-
-        .stat-label {
-            color: var(--text-secondary);
-        }
-
-        .stat-value {
-            color: var(--text-primary);
-            font-weight: 500;
-            font-variant-numeric: tabular-nums;
-        }
-
-        /* Main content */
-        .main-content {
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-
-        .content-header {
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background-color: var(--bg-secondary);
-        }
-
-        .header-controls {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .account-area {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .search-input {
-            padding: 6px 10px 6px 28px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-primary);
-            font-size: 12px;
-            width: 220px;
-            transition: all 0.15s;
-        }
-
-        .search-input::placeholder {
-            color: var(--text-tertiary);
-        }
-
-        .search-input:hover {
-            border-color: var(--text-tertiary);
-        }
-
-        .search-input:focus {
-            outline: none;
-            border-color: var(--accent-blue);
-        }
-
-        .search-wrapper {
-            position: relative;
-        }
-
-        .search-icon {
-            position: absolute;
-            left: 9px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text-tertiary);
-            font-size: 12px;
-            pointer-events: none;
-        }
-
-        .header-account-select {
-            padding: 6px 10px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-primary);
-            font-size: 12px;
-            cursor: pointer;
-            min-width: 140px;
-        }
-
-        .header-account-select:hover {
-            border-color: var(--text-tertiary);
-        }
-
-        .header-account-select:focus {
-            outline: none;
-            border-color: var(--accent-blue);
-        }
-
-        .account-avatar {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            border: 2px solid var(--border-color);
-            object-fit: cover;
-            transition: border-color 0.15s;
-        }
-
-        .account-avatar:hover {
-            border-color: var(--accent-blue);
-        }
-
-        .account-avatar-fallback {
-            width: 32px;
-            height: 32px;
-            border-radius: 50%;
-            background: var(--bg-tertiary);
-            border: 2px solid var(--border-color);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            transition: border-color 0.15s;
-        }
-
-        .account-avatar-fallback:hover {
-            border-color: var(--accent-blue);
-        }
-
-        .account-settings-btn {
-            background: none;
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-secondary);
-            font-size: 16px;
-            width: 32px;
-            height: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-
-        .account-settings-btn:hover {
-            color: var(--text-primary);
-            border-color: var(--text-tertiary);
-            background: var(--bg-tertiary);
-        }
-
-        /* Modal */
-        .modal-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(0, 0, 0, 0.6);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .modal-content {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            width: 440px;
-            max-height: 80vh;
-            overflow-y: auto;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-        }
-
-        .modal-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 16px 20px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .modal-title {
-            font-size: 15px;
-            font-weight: 600;
-            color: var(--text-primary);
-            margin: 0;
-        }
-
-        .modal-close {
-            background: none;
-            border: none;
-            color: var(--text-tertiary);
-            font-size: 18px;
-            cursor: pointer;
-            padding: 4px 8px;
-            border-radius: 4px;
-            transition: all 0.15s;
-        }
-
-        .modal-close:hover {
-            color: var(--text-primary);
-            background: var(--bg-tertiary);
-        }
-
-        .modal-body {
-            padding: 16px 20px;
-        }
-
-        .modal-account-count {
-            color: var(--text-secondary);
-            font-size: 13px;
-            margin-bottom: 16px;
-        }
-
-        .modal-account-card {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 12px;
-            background: var(--bg-tertiary);
-            border-radius: 8px;
-            margin-bottom: 8px;
-        }
-
-        .modal-account-avatar {
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            object-fit: cover;
-            flex-shrink: 0;
-        }
-
-        .modal-account-avatar-fallback {
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            background: var(--bg-hover);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 15px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            flex-shrink: 0;
-        }
-
-        .modal-account-info {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .modal-account-name {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .modal-account-email {
-            font-size: 11px;
-            color: var(--text-secondary);
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .modal-disconnect-btn {
-            padding: 5px 12px;
-            font-size: 11px;
-            font-weight: 500;
-            background: none;
-            border: 1px solid var(--accent-red);
-            color: var(--accent-red);
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.15s;
-            flex-shrink: 0;
-        }
-
-        .modal-disconnect-btn:hover {
-            background: var(--accent-red);
-            color: white;
-        }
-
-        .modal-connect-btn {
-            display: block;
-            width: 100%;
-            padding: 10px;
-            margin-top: 16px;
-            background: var(--accent-blue);
-            border: none;
-            border-radius: 8px;
-            color: white;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.15s;
-        }
-
-        .modal-connect-btn:hover {
-            background: #0066d6;
-        }
-
-        .sync-btn {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            padding: 6px 12px;
-            background: var(--accent-blue);
-            border: none;
-            border-radius: 6px;
-            color: white;
-            font-size: 12px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-
-        .sync-btn:hover {
-            background: #0066d6;
-        }
-
-        .sync-btn:disabled {
-            background: var(--bg-tertiary);
-            color: var(--text-tertiary);
-            cursor: not-allowed;
-        }
-
-        .sync-badge {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            min-width: 18px;
-            height: 18px;
-            padding: 0 5px;
-            background: var(--accent-red);
-            color: white;
-            font-size: 10px;
-            font-weight: 700;
-            border-radius: 9px;
-            margin-left: 2px;
-            line-height: 1;
-        }
-
-        .sync-btn .sync-icon {
-            font-size: 14px;
-            transition: transform 0.3s;
-        }
-
-        .sync-btn.loading .sync-icon {
-            animation: spin 1s linear infinite;
-        }
-
-        .content-title {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .content-subtitle {
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        /* Order list */
-        .order-list {
-            flex: 1;
-            overflow-y: auto;
-            padding: 0;
-            background-color: var(--bg-secondary);
-        }
-
-        .order-item {
-            display: grid;
-            grid-template-columns: 56px 140px 1fr auto auto auto auto;
-            gap: 16px;
-            align-items: center;
-            padding: 14px 20px;
-            border-bottom: 1px solid var(--border-color);
-            cursor: pointer;
-            transition: background-color 0.15s;
-        }
-
-        .order-item:hover {
-            background-color: var(--bg-tertiary);
-        }
-
-        .order-item.expanded {
-            background-color: var(--bg-tertiary);
-        }
-
-        .order-main {
-            min-width: 0;
-        }
-
-        .order-id {
-            font-size: 13px;
-            font-weight: 500;
-            color: var(--text-primary);
-            font-variant-numeric: tabular-nums;
-        }
-
-        .order-date {
-            font-size: 12px;
-            color: var(--text-secondary);
-            margin-top: 2px;
-        }
-
-        .order-status {
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 500;
-            text-transform: capitalize;
-        }
-
-        .status-confirmed { background: rgba(10, 132, 255, 0.2); color: #4da3ff; }
-        .status-shipped { background: rgba(255, 159, 10, 0.2); color: #ffb340; }
-        .status-delivered { background: rgba(48, 209, 88, 0.2); color: #5ee07a; }
-        .status-canceled { background: rgba(255, 69, 58, 0.2); color: #ff6b63; }
-        .status-partially_canceled { background: rgba(191, 90, 242, 0.2); color: #cc7df5; }
-
-        .order-items-count {
-            font-size: 12px;
-            color: var(--text-secondary);
-            text-align: right;
-            min-width: 60px;
-        }
-
-        .order-product {
-            font-size: 11px;
-            color: var(--text-tertiary);
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            min-width: 0;
-        }
-
-        .order-price {
-            font-size: 12px;
-            color: var(--text-secondary);
-            font-variant-numeric: tabular-nums;
-            min-width: 60px;
-            text-align: right;
-        }
-
-        .order-qty {
-            font-size: 12px;
-            color: var(--text-tertiary);
-            font-variant-numeric: tabular-nums;
-            min-width: 40px;
-            text-align: right;
-        }
-
-        /* Expanded order details */
-        .order-details {
-            display: none;
-            padding: 0 20px 16px 20px;
-            background-color: var(--bg-tertiary);
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .order-details.show {
-            display: block;
-        }
-
-        .detail-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            padding-top: 12px;
-            border-top: 1px solid var(--border-color);
-        }
-
-        .detail-section h4 {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            color: var(--text-tertiary);
-            margin-bottom: 8px;
-        }
-
-        .detail-value {
-            font-size: 13px;
-            color: var(--text-primary);
-        }
-
-        .detail-link {
-            color: var(--accent-blue);
-            text-decoration: none;
-        }
-
-        .detail-link:hover {
-            text-decoration: underline;
-        }
-
-        .item-list {
-            list-style: none;
-            padding: 0;
-            margin: 0;
-        }
-
-        .item-list li {
-            font-size: 12px;
-            color: var(--text-secondary);
-            padding: 4px 0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .item-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .item-thumb {
-            width: 44px;
-            height: 44px;
-            border-radius: 6px;
-            object-fit: contain;
-            background: transparent;
-            border: 1px solid var(--border-color);
-            flex: 0 0 auto;
-        }
-
-        .item-name {
-            flex: 1;
-            min-width: 0;
-        }
-
-        .item-qty {
-            color: var(--text-tertiary);
-            font-size: 11px;
-        }
-
-        .item-canceled {
-            text-decoration: line-through;
-            color: var(--accent-red);
-        }
-
-        /* Empty state */
-        .empty-state {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100%;
-            color: var(--text-secondary);
-            font-size: 14px;
-        }
-
-        /* Footer */
-        .app-footer {
-            padding: 12px 20px;
-            border-top: 1px solid var(--border-color);
-            font-size: 11px;
-            color: var(--text-tertiary);
-            background-color: var(--bg-secondary);
-        }
-
-        /* Scrollbar */
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--bg-tertiary); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
-
-        /* Skeleton loading */
-        .skeleton {
-            background: linear-gradient(90deg, var(--bg-tertiary) 25%, var(--bg-hover) 50%, var(--bg-tertiary) 75%);
-            background-size: 200% 100%;
-            animation: shimmer 1.5s infinite;
-            border-radius: 4px;
-        }
-        @keyframes shimmer {
-            0% { background-position: 200% 0; }
-            100% { background-position: -200% 0; }
-        }
-
-        /* Tracking status styles */
-        .tracking-section {
-            grid-column: span 2;
-        }
-
-        .tracking-status-container {
-            margin-top: 8px;
-        }
-
-        .tracking-status {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 8px;
-        }
-
-        .tracking-badge {
-            padding: 3px 8px;
-            border-radius: 10px;
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-
-        .badge-gray { background: rgba(152, 152, 157, 0.2); color: #98989d; }
-        .badge-blue { background: rgba(10, 132, 255, 0.2); color: #4da3ff; }
-        .badge-yellow { background: rgba(255, 159, 10, 0.2); color: #ffb340; }
-        .badge-green { background: rgba(48, 209, 88, 0.2); color: #5ee07a; }
-        .badge-red { background: rgba(255, 69, 58, 0.2); color: #ff6b63; }
-        .badge-purple { background: rgba(191, 90, 242, 0.2); color: #cc7df5; }
-
-        .tracking-desc {
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        .tracking-events {
-            margin-top: 8px;
-            padding-left: 8px;
-            border-left: 2px solid var(--border-color);
-        }
-
-        .tracking-event {
-            font-size: 11px;
-            padding: 4px 0;
-        }
-
-        .tracking-fetched {
-            font-size: 10px;
-            color: var(--text-tertiary);
-            margin-top: 8px;
-        }
-
-        /* FedEx-style tracking timeline */
-        .tracking-timeline {
-            margin-top: 12px;
-        }
-
-        .timeline-date-group {
-            margin-bottom: 16px;
-        }
-
-        .timeline-date {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-secondary);
-            margin-bottom: 8px;
-            padding-bottom: 4px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .timeline-event {
-            display: grid;
-            grid-template-columns: 80px 1fr auto;
-            gap: 12px;
-            padding: 6px 0;
-            font-size: 12px;
-            align-items: baseline;
-        }
-
-        .timeline-time {
-            color: var(--text-tertiary);
-            text-align: right;
-            font-variant-numeric: tabular-nums;
-        }
-
-        .timeline-desc {
-            color: var(--text-primary);
-        }
-
-        .timeline-loc {
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            font-size: 11px;
-        }
-
-        .fetch-tracking-btn {
-            margin-top: 8px;
-            padding: 6px 12px;
-            background: var(--accent-blue);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 11px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: background-color 0.15s;
-        }
-
-        .fetch-tracking-btn:hover {
-            background: #2998ff;
-        }
-
-        .fetch-tracking-btn:disabled {
-            background: var(--bg-tertiary);
-            color: var(--text-tertiary);
-            cursor: wait;
-        }
-
-        .fetch-tracking-btn.loading {
-            position: relative;
-            color: transparent;
-        }
-
-        .fetch-tracking-btn.loading::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 14px;
-            height: 14px;
-            margin: -7px 0 0 -7px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-top-color: white;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* Date range presets */
-        .date-presets {
-            display: flex;
-            gap: 6px;
-            padding: 0 8px;
-        }
-
-        .date-preset {
-            flex: 1;
-            padding: 6px 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-secondary);
-            font-size: 11px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.15s;
-        }
-
-        .date-preset:hover {
-            background: var(--bg-hover);
-            color: var(--text-primary);
-        }
-
-        .date-preset.active {
-            background: var(--accent-blue);
-            color: white;
-            border-color: var(--accent-blue);
-        }
-
-        .fetch-since-input {
-            width: 100%;
-            padding: 6px 8px;
-            background: var(--bg-tertiary);
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            color: var(--text-primary);
-            font-size: 12px;
-            font-family: inherit;
-            cursor: pointer;
-            color-scheme: dark;
-            transition: border-color 0.15s;
-        }
-
-        .fetch-since-input:hover {
-            border-color: var(--text-tertiary);
-        }
-
-        .fetch-since-input:focus {
-            outline: none;
-            border-color: var(--accent-blue);
-        }
-
-        .fetch-since-hint {
-            font-size: 10px;
-            color: var(--text-tertiary);
-            margin-top: 4px;
-            padding: 0 2px;
-        }
-
-        .fetch-since-warn {
-            color: var(--accent-orange);
-        }
-
-        .order-thumb {
-            width: 56px;
-            height: 56px;
-            border-radius: 10px;
-            object-fit: contain;
-            background: transparent;
-            border: none;
-            display: block;
-        }
-
-        .order-thumb:not([src]) {
-            visibility: hidden;
-        }
-
-        .order-thumb.placeholder {
-            background: var(--bg-tertiary);
-        }
-    </style>
 </head>
 <body>
-    <div class="app-container">
-        <!-- Sidebar -->
-        <aside class="sidebar">
-            <div class="sidebar-header">
-                <div class="sidebar-title">Total Orders</div>
-                <div id="total-count" class="sidebar-count">--</div>
-            </div>
+    <div class="app-shell">
+        <!-- Tab Bar -->
+        <nav class="tab-bar" id="tab-bar">
+            <button class="tab-item active" data-tab="orders">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/>
+                </svg>
+                Orders
+            </button>
+            <button class="tab-item" data-tab="analytics">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>
+                </svg>
+                Analytics
+            </button>
+            <button class="tab-item" data-tab="accounts">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/>
+                </svg>
+                Accounts
+            </button>
+            <button class="tab-item" data-tab="settings">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+                </svg>
+                Settings
+            </button>
 
-            <div class="filter-section">
-                <div class="filter-label">Status</div>
-                <div id="status-filters">
-                    <div class="filter-item active" data-filter="all">
-                        <span class="filter-dot" style="background: var(--text-secondary);"></span>
-                        All Orders
-                        <span class="filter-count" id="count-all">--</span>
-                    </div>
-                    <div class="filter-item" data-filter="confirmed">
-                        <span class="filter-dot" style="background: var(--accent-blue);"></span>
-                        Confirmed
-                        <span class="filter-count" id="count-confirmed">--</span>
-                    </div>
-                    <div class="filter-item" data-filter="shipped">
-                        <span class="filter-dot" style="background: var(--accent-orange);"></span>
-                        Shipped
-                        <span class="filter-count" id="count-shipped">--</span>
-                    </div>
-                    <div class="filter-item" data-filter="delivered">
-                        <span class="filter-dot" style="background: var(--accent-green);"></span>
-                        Delivered
-                        <span class="filter-count" id="count-delivered">--</span>
-                    </div>
-                    <div class="filter-item" data-filter="canceled">
-                        <span class="filter-dot" style="background: var(--accent-red);"></span>
-                        Canceled
-                        <span class="filter-count" id="count-canceled">--</span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Date Range Filter -->
-            <div class="filter-section" id="date-range-section">
-                <div class="filter-label">Date Range</div>
-                <div class="date-presets">
-                    <button class="date-preset" data-days="1">24h</button>
-                    <button class="date-preset" data-days="7">7d</button>
-                    <button class="date-preset" data-days="30">30d</button>
-                    <button class="date-preset" data-days="90">90d</button>
-                    <button class="date-preset active" data-days="0">All</button>
+            <div class="tab-bar-actions">
+                <button id="sync-btn" class="sync-btn">
+                    <span class="sync-icon">&#8635;</span> Sync
+                </button>
+                <div class="account-area">
+                    <select id="account-select" class="header-account-select" style="display: none;">
+                        <option value="">All Accounts</option>
+                    </select>
+                    <img id="account-avatar" class="account-avatar" src="" alt="" style="display: none;" title="Manage accounts">
+                    <div id="account-avatar-fallback" class="account-avatar-fallback" style="display: none;" title="Manage accounts"></div>
                 </div>
             </div>
 
-            <!-- Fetch Since Date (controls Gmail sync range) -->
-            <div class="filter-section" id="fetch-since-section">
-                <div class="filter-label">Fetch Emails Since</div>
-                <div style="padding: 0 8px;">
-                    <input type="date" id="fetch-since-date" class="fetch-since-input"
-                           title="Sync will fetch emails back to this date">
-                    <div id="fetch-since-hint" class="fetch-since-hint">Default: last 5 days</div>
+            <div class="tab-bar-indicator"></div>
+        </nav>
+
+        <!-- Sync Progress (visible on all tabs) -->
+        <div id="sync-progress" class="sync-progress" style="display: none;">
+            <div class="sync-progress-bar">
+                <div class="sync-progress-fill" id="sync-progress-fill"></div>
+            </div>
+            <div class="sync-progress-text" id="sync-progress-text"></div>
+        </div>
+
+        <!-- Tab Content -->
+        <div class="tab-content">
+            <!-- Orders Tab -->
+            <div class="tab-panel active" id="panel-orders">
+                <div class="orders-layout">
+                    <!-- Sidebar -->
+                    <aside class="sidebar">
+                        <div class="sidebar-header">
+                            <div class="sidebar-title">Total Orders</div>
+                            <div id="total-count" class="sidebar-count">--</div>
+                        </div>
+
+                        <div class="filter-section">
+                            <div class="filter-label">Status</div>
+                            <div id="status-filters">
+                                <div class="filter-item active" data-filter="all">
+                                    <span class="filter-dot" style="background: var(--text-secondary);"></span>
+                                    All Orders
+                                    <span class="filter-count" id="count-all">--</span>
+                                </div>
+                                <div class="filter-item" data-filter="confirmed">
+                                    <span class="filter-dot" style="background: var(--accent-blue);"></span>
+                                    Confirmed
+                                    <span class="filter-count" id="count-confirmed">--</span>
+                                </div>
+                                <div class="filter-item" data-filter="shipped">
+                                    <span class="filter-dot" style="background: var(--accent-orange);"></span>
+                                    Shipped
+                                    <span class="filter-count" id="count-shipped">--</span>
+                                </div>
+                                <div class="filter-item" data-filter="delivered">
+                                    <span class="filter-dot" style="background: var(--accent-green);"></span>
+                                    Delivered
+                                    <span class="filter-count" id="count-delivered">--</span>
+                                </div>
+                                <div class="filter-item" data-filter="canceled">
+                                    <span class="filter-dot" style="background: var(--accent-red);"></span>
+                                    Canceled
+                                    <span class="filter-count" id="count-canceled">--</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Date Range Filter -->
+                        <div class="filter-section" id="date-range-section">
+                            <div class="filter-label">Date Range</div>
+                            <div class="date-presets">
+                                <button class="date-preset" data-days="1">24h</button>
+                                <button class="date-preset" data-days="7">7d</button>
+                                <button class="date-preset" data-days="30">30d</button>
+                                <button class="date-preset" data-days="90">90d</button>
+                                <button class="date-preset active" data-days="0">All</button>
+                            </div>
+                        </div>
+
+                        <div style="margin-top: auto; padding: 8px; font-size: 11px; color: var(--text-tertiary);">
+                            <span id="pending-emails">-- pending</span>
+                        </div>
+                    </aside>
+
+                    <!-- Main Content -->
+                    <main class="main-content">
+                        <div class="content-header">
+                            <div>
+                                <div class="content-title" id="filter-title">All Orders</div>
+                                <div class="content-subtitle" id="last-updated">Loading...</div>
+                            </div>
+                            <div class="search-wrapper">
+                                <span class="search-icon">&#8981;</span>
+                                <input id="search-input" class="search-input" type="text" placeholder="Search orders, products, status...">
+                            </div>
+                        </div>
+
+                        <div class="order-list" id="order-list">
+                            <!-- Loading skeleton -->
+                            <div class="order-item">
+                                <div class="skeleton" style="width: 56px; height: 56px; border-radius: 10px;"></div>
+                                <div class="order-main">
+                                    <div class="skeleton" style="width: 140px; height: 16px; margin-bottom: 6px;"></div>
+                                    <div class="skeleton" style="width: 80px; height: 14px;"></div>
+                                </div>
+                                <div class="skeleton" style="width: 70px; height: 24px; border-radius: 12px;"></div>
+                                <div class="skeleton" style="width: 50px; height: 14px;"></div>
+                            </div>
+                        </div>
+
+                        <div class="app-footer">
+                            <span id="last-updated-footer">Walmart Order Tracker</span>
+                        </div>
+                    </main>
                 </div>
             </div>
 
-            <!-- Stats Dashboard -->
-            <div class="stats-section">
-                <div class="filter-label">Statistics</div>
-                <div class="stat-item">
-                    <span class="stat-label">Total Spent</span>
-                    <span class="stat-value" id="stat-total-spent">--</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Total Qty</span>
-                    <span class="stat-value" id="stat-total-qty">--</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Avg Order</span>
-                    <span class="stat-value" id="stat-avg-order">--</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">This Week</span>
-                    <span class="stat-value" id="stat-this-week">--</span>
-                </div>
+            <!-- Analytics Tab -->
+            <div class="tab-panel" id="panel-analytics">
+                <div class="analytics-content" id="analytics-content"></div>
             </div>
 
-            <div style="margin-top: auto; padding: 8px; font-size: 11px; color: var(--text-tertiary);">
-                <span id="pending-emails">-- pending</span>
-            </div>
-        </aside>
-
-        <!-- Main Content -->
-        <main class="main-content">
-            <div class="content-header">
-                <div>
-                    <div class="content-title" id="filter-title">All Orders</div>
-                    <div class="content-subtitle" id="last-updated">Loading...</div>
-                </div>
-                <div class="search-wrapper">
-                    <span class="search-icon">⌕</span>
-                    <input id="search-input" class="search-input" type="text" placeholder="Search orders, products, status...">
-                </div>
-                <div class="header-controls">
-                    <button id="sync-btn" class="sync-btn" onclick="syncOrders()">
-                        <span class="sync-icon">↻</span> Sync
-                    </button>
-                    <div class="account-area">
-                        <select id="account-select" class="header-account-select" onchange="handleAccountChange(this.value)" style="display: none;">
-                            <option value="">All Accounts</option>
-                        </select>
-                        <img id="account-avatar" class="account-avatar" src="" alt="" style="display: none;"
-                             onerror="this.style.display='none'; document.getElementById('account-avatar-fallback').style.display='flex';">
-                        <div id="account-avatar-fallback" class="account-avatar-fallback" style="display: none;"></div>
-                        <button id="account-settings-btn" class="account-settings-btn" onclick="openAccountModal()" title="Manage accounts">⚙</button>
-                    </div>
-                </div>
+            <!-- Accounts Tab -->
+            <div class="tab-panel" id="panel-accounts">
+                <div class="accounts-content" id="accounts-content"></div>
             </div>
 
-            <div class="order-list" id="order-list">
-                <!-- Loading skeleton -->
-                <div class="order-item">
-                    <div class="skeleton" style="width: 56px; height: 56px; border-radius: 10px;"></div>
-                    <div class="order-main">
-                        <div class="skeleton" style="width: 140px; height: 16px; margin-bottom: 6px;"></div>
-                        <div class="skeleton" style="width: 80px; height: 14px;"></div>
-                    </div>
-                    <div class="skeleton" style="width: 70px; height: 24px; border-radius: 12px;"></div>
-                    <div class="skeleton" style="width: 50px; height: 14px;"></div>
-                </div>
+            <!-- Settings Tab -->
+            <div class="tab-panel" id="panel-settings">
+                <div class="settings-content" id="settings-content"></div>
             </div>
-
-            <div class="app-footer">
-                <span id="last-updated-footer">Walmart Order Tracker</span>
-            </div>
-        </main>
+        </div>
     </div>
 
-    <div id="account-modal-overlay" class="modal-overlay" style="display: none;" onclick="closeAccountModal(event)">
-        <div class="modal-content" onclick="event.stopPropagation()">
+    <div id="account-modal-overlay" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
             <div class="modal-header">
                 <h2 class="modal-title">Manage Connected Accounts</h2>
-                <button class="modal-close" onclick="closeAccountModal()">✕</button>
+                <button class="modal-close">&#10005;</button>
             </div>
             <div class="modal-body" id="account-modal-body"></div>
         </div>
     </div>
 
-    <script type="module" src="scripts/dashboard.js"></script>
+    <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

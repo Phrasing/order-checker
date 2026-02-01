@@ -152,6 +152,8 @@ pub struct WalmartOrder {
     pub recipient: Option<String>,
     /// Associated Gmail account ID (for multi-account support)
     pub account_id: Option<i64>,
+    /// Reason for cancellation (if this is a canceled order)
+    pub cancel_reason: Option<String>,
 }
 
 impl WalmartOrder {
@@ -181,6 +183,7 @@ impl WalmartOrder {
             carrier: None,
             recipient: None,
             account_id: None,
+            cancel_reason: None,
         }
     }
 
@@ -211,6 +214,11 @@ impl WalmartOrder {
     pub fn with_tracking(mut self, tracking_number: String, carrier: String) -> Self {
         self.tracking_number = Some(tracking_number);
         self.carrier = Some(carrier);
+        self
+    }
+
+    pub fn with_cancel_reason(mut self, reason: String) -> Self {
+        self.cancel_reason = Some(reason);
         self
     }
 }

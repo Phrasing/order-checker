@@ -6,18 +6,21 @@ use futures::future;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use base64::Engine;
 use sqlx::Row;
-use walmart_dashboard::auth::{self, AccountAuth, get_gmail_client_for_account, fetch_profile_picture_url};
+use sqlx::types::chrono::Utc;
+use walmart_dashboard::auth::{self, AccountAuth, CallbackFlowDelegate, get_gmail_client_for_account, fetch_profile_picture_url};
 use walmart_dashboard::db::Database;
 use tokio::sync::Semaphore;
 use walmart_dashboard::ingestion;
 use walmart_dashboard::process;
 use walmart_dashboard::tracking::{self, TrackingService};
 use walmart_dashboard::web::{
-    AccountViewModel, DashboardData, fetch_account_view_models, get_dashboard_data_with_dates,
+    AccountViewModel, AggregateStats, DashboardData, DashboardDataV2, PaginatedOrders,
+    fetch_account_view_models, get_dashboard_data_with_dates,
 };
 
 /// Application state managed by Tauri
@@ -26,6 +29,11 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub client_secret_path: PathBuf,
     pub tracking_service: TrackingService,
+    /// Directory for storing OAuth token cache files (app data dir).
+    /// Kept outside the project tree to avoid triggering the Tauri dev file watcher.
+    pub token_dir: PathBuf,
+    /// Cancellation sender for an in-progress OAuth flow (if any).
+    pub auth_cancel: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 /// Get dashboard data for the frontend
@@ -39,6 +47,137 @@ pub async fn get_dashboard(
     end_date: Option<String>,
 ) -> Result<DashboardData, String> {
     get_dashboard_data_with_dates(
+        &state.db,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Get dashboard data with pagination support (V2)
+/// Returns paginated orders for improved performance with large datasets
+#[tauri::command]
+pub async fn get_dashboard_v2(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    status_filter: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<DashboardDataV2, String> {
+    let db = &state.db;
+    let page_size = limit.unwrap_or(100).min(500); // Default 100, cap at 500
+
+    let paginated_orders = walmart_dashboard::web::fetch_orders_paginated(
+        db,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+        status_filter.as_deref(),
+        cursor.as_deref(),
+        page_size,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let status_counts = walmart_dashboard::web::fetch_status_counts_with_dates(
+        db,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let accounts = walmart_dashboard::web::fetch_account_view_models(db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let pending_emails = walmart_dashboard::web::fetch_pending_email_count_filtered(db, account_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Generate timestamp using the same format as existing dashboard
+    let last_updated = format!("{}", Utc::now().format("%Y-%m-%d %H:%M:%S UTC"));
+
+    Ok(DashboardDataV2 {
+        paginated_orders,
+        status_counts,
+        accounts,
+        selected_account_id: account_id,
+        pending_emails,
+        last_updated,
+    })
+}
+
+/// Fetch more orders for pagination
+#[tauri::command]
+pub async fn fetch_more_orders(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    status_filter: Option<String>,
+    cursor: String,
+    limit: Option<usize>,
+) -> Result<PaginatedOrders, String> {
+    let db = &state.db;
+    let page_size = limit.unwrap_or(100).min(500);
+
+    walmart_dashboard::web::fetch_orders_paginated(
+        db,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+        status_filter.as_deref(),
+        Some(&cursor),
+        page_size,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Search orders by query string
+/// Searches across order ID, recipient email, and item names
+#[tauri::command]
+pub async fn search_orders(
+    state: State<'_, AppState>,
+    query: String,
+    account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    status_filter: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<walmart_dashboard::web::OrderViewModel>, String> {
+    let db = &state.db;
+    let search_limit = limit.unwrap_or(100).min(500); // Default 100, cap at 500
+
+    walmart_dashboard::web::search_orders(
+        db,
+        &query,
+        account_id,
+        start_date.as_deref(),
+        end_date.as_deref(),
+        status_filter.as_deref(),
+        search_limit,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Get aggregate statistics without loading full order data
+/// Much faster than loading all orders for large datasets
+#[tauri::command]
+pub async fn get_aggregate_stats(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+) -> Result<AggregateStats, String> {
+    walmart_dashboard::web::fetch_aggregate_stats(
         &state.db,
         account_id,
         start_date.as_deref(),
@@ -200,13 +339,19 @@ pub async fn fetch_tracking(
     }
 }
 
-/// Manually restart the Chrome tracking session.
-/// Use this if tracking fetches are consistently failing due to session issues.
+/// Manually clear the tracking client and global credential cache.
+///
+/// With the new V8 architecture, credentials are cached globally for 1 hour
+/// across all Track17Client instances. This clears both the local client and
+/// the shared credential cache, forcing fresh credential extraction (~400-500ms)
+/// on the next tracking request.
+///
+/// Use when tracking fetches consistently fail due to credential issues.
 #[tauri::command]
 pub async fn restart_tracking_session(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    tracing::info!("Manual session restart requested");
+    tracing::info!("Manual credential cache clear requested");
 
     state
         .tracking_service
@@ -214,7 +359,7 @@ pub async fn restart_tracking_session(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok("Tracking session restarted successfully".to_string())
+    Ok("Tracking client and credentials cleared successfully".to_string())
 }
 
 // ==================== Process Commands ====================
@@ -265,19 +410,38 @@ pub struct SyncResult {
     pub message: String,
 }
 
+/// Progress event payload emitted during sync stages
+#[derive(Clone, Serialize)]
+struct SyncProgress {
+    stage: u8,
+    total_stages: u8,
+    label: String,
+    detail: String,
+}
+
+fn emit_progress(app: &AppHandle, stage: u8, label: &str, detail: &str) {
+    let _ = app.emit("sync-progress", SyncProgress {
+        stage,
+        total_stages: 5,
+        label: label.to_string(),
+        detail: detail.to_string(),
+    });
+}
+
 /// Internal sync+process logic (separated from tauri command to avoid State lifetime issues)
 async fn perform_sync_and_process(
     db: Arc<Database>,
-    db_path: PathBuf,
     client_secret_path: PathBuf,
     tracking_service: TrackingService,
     fetch_since: Option<String>,
+    token_dir: PathBuf,
+    app: AppHandle,
 ) -> Result<SyncResult, String> {
     let mut errors = Vec::new();
     let mut total_synced = 0usize;
 
-    // Resolve the base directory for token cache files (same directory as the database)
-    let base_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    // Use token_dir for resolving token cache paths
+    let base_dir = &token_dir;
 
     // Get all active accounts
     let accounts = db.list_accounts().await.map_err(|e| e.to_string())?;
@@ -292,8 +456,10 @@ async fn perform_sync_and_process(
         });
     }
 
-    // Pre-warm tracking client (launches Chrome) concurrently with email sync.
-    // This overlaps the ~3-5s Chrome startup with the email fetch stage.
+    // Pre-warm tracking client concurrently with email sync.
+    // First call (or after 1-hour cache expiry) takes ~400-500ms to extract
+    // credentials via brief Chrome launch. Overlapping this with email fetch
+    // hides the latency and ensures warm cache for batch tracking operations.
     let tracking_warmup = {
         let ts = tracking_service.clone();
         tokio::spawn(async move {
@@ -303,14 +469,18 @@ async fn perform_sync_and_process(
         })
     };
 
-    // Sync all active accounts in parallel — each account hits a different
-    // Gmail mailbox with its own OAuth token, so there's no shared resource conflict.
-    // SQLite WAL mode handles concurrent writes.
-    // A shared semaphore caps total in-flight Gmail requests across ALL accounts
-    // to avoid rate-limit storms when multiple accounts sync concurrently.
+    // Stage 1+2: Concurrent sync + process
     let active_accounts: Vec<_> = accounts.iter().filter(|a| a.is_active).collect();
-    let rate_limit = Arc::new(Semaphore::new(ingestion::max_concurrent_fetches()));
+    emit_progress(&app, 1, "Syncing & processing", &format!(
+        "Syncing {} account{} and processing concurrently...",
+        active_accounts.len(),
+        if active_accounts.len() == 1 { "" } else { "s" }
+    ));
+    let max_fetches = ingestion::max_concurrent_fetches();
 
+    let ingestion_done = Arc::new(AtomicBool::new(false));
+
+    // Build sync futures (unchanged logic per account)
     let sync_futures: Vec<_> = active_accounts
         .iter()
         .map(|acc| {
@@ -321,7 +491,9 @@ async fn perform_sync_and_process(
             let email = acc.email.clone();
             let acc_id = acc.id;
             let token_cache_path = acc.token_cache_path.clone();
-            let rate_limit = Some(Arc::clone(&rate_limit));
+            // Per-account semaphore: Gmail quotas are per-user, so each account
+            // gets its own concurrency limit instead of sharing a single pool.
+            let rate_limit = Some(Arc::new(Semaphore::new(max_fetches)));
 
             async move {
                 tracing::info!(email = %email, "Syncing emails for account");
@@ -396,7 +568,19 @@ async fn perform_sync_and_process(
         })
         .collect();
 
+    // Spawn processing task — starts immediately, processes emails as they arrive from sync
+    let db_process = db.clone();
+    let ingestion_done_clone = ingestion_done.clone();
+    let process_handle = tokio::spawn(async move {
+        process::process_pending_events_concurrent(&db_process, Some(ingestion_done_clone)).await
+    });
+
+    // Run all sync tasks to completion
     let sync_results = future::join_all(sync_futures).await;
+
+    // Signal that all ingestion is complete
+    ingestion_done.store(true, Ordering::Release);
+
     for result in sync_results {
         match result {
             Ok(synced) => total_synced += synced,
@@ -404,33 +588,46 @@ async fn perform_sync_and_process(
         }
     }
 
-    // Process all pending emails into orders (must complete before image/tracking)
-    let process_stats = process::process_pending_events(&db)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Wait for processing to drain remaining queue
+    emit_progress(&app, 2, "Finishing processing", &format!(
+        "Draining remaining emails after syncing {}...",
+        total_synced
+    ));
+    let process_stats = match process_handle.await {
+        Ok(Ok(stats)) => stats,
+        Ok(Err(e)) => {
+            errors.push(format!("Processing failed: {}", e));
+            process::ProcessStats::default()
+        }
+        Err(e) => {
+            errors.push(format!("Processing task panicked: {}", e));
+            process::ProcessStats::default()
+        }
+    };
 
     // Ensure tracking client pre-warm has completed before tracking stage
+    // (credential extraction should be done by now)
     let _ = tracking_warmup.await;
 
-    // Run image processing and tracking fetch concurrently — these are independent
-    // I/O-bound stages that don't conflict: images hit the rembg server while
-    // tracking hits the 17track API.
+    // Stage 3: Images + tracking (concurrent)
+    emit_progress(&app, 3, "Fetching images & tracking", "Updating images and tracking data...");
     let db_img = db.clone();
     let db_track = db.clone();
     let db_delivered = db.clone();
     let ts = tracking_service.clone();
 
-    let (img_result, tracking_result, delivered_result) = tokio::join!(
+    let (img_result, tracking_result) = tokio::join!(
         async move {
             process::process_missing_product_images(&db_img).await
         },
         async move {
             tracking::fetch_missing_tracking_batch(&db_track, &ts).await
         },
-        async move {
-            tracking::sync_delivered_from_tracking(&db_delivered).await
-        },
     );
+
+    // Stage 4: Sync delivered statuses (must be sequential after tracking fetch)
+    emit_progress(&app, 4, "Syncing statuses", "Updating delivery statuses...");
+    let delivered_result = tracking::sync_delivered_from_tracking(&db_delivered).await;
 
     if let Err(e) = img_result {
         tracing::warn!("Failed to process product images: {}", e);
@@ -457,6 +654,9 @@ async fn perform_sync_and_process(
         )
     };
 
+    // Stage 5: Complete
+    emit_progress(&app, 5, "Sync complete", &message);
+
     Ok(SyncResult {
         success,
         emails_synced: total_synced,
@@ -470,14 +670,15 @@ async fn perform_sync_and_process(
 /// This combines the sync + process workflow into a single command
 #[tauri::command]
 pub async fn sync_and_process_orders(
+    app: AppHandle,
     state: State<'_, AppState>,
     fetch_since: Option<String>,
 ) -> Result<SyncResult, String> {
     tracing::info!("Sync command invoked");
     let db = Arc::clone(&state.db);
-    let db_path = state.db_path.clone();
     let client_secret_path = state.client_secret_path.clone();
     let tracking_service = state.tracking_service.clone();
+    let token_dir = state.token_dir.clone();
 
     // Run sync in a dedicated thread to avoid HRTB Send issues with the
     // tauri command macro (library futures contain non-Send-for-all-lifetimes types)
@@ -486,10 +687,11 @@ pub async fn sync_and_process_orders(
         let result = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(perform_sync_and_process(
                 db,
-                db_path,
                 client_secret_path,
                 tracking_service,
                 fetch_since,
+                token_dir,
+                app,
             )),
             Err(e) => Err(format!("Failed to create sync runtime: {}", e)),
         };
@@ -578,22 +780,18 @@ pub async fn check_new_emails(
     fetch_since: Option<String>,
 ) -> Result<ingestion::NewEmailCheck, String> {
     let db = Arc::clone(&state.db);
-    let db_path = state.db_path.clone();
     let client_secret_path = state.client_secret_path.clone();
+    let token_dir = state.token_dir.clone();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
 
     std::thread::spawn(move || {
-        let base_dir = db_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
         let result = match tokio::runtime::Runtime::new() {
             Ok(rt) => Ok(rt.block_on(async {
                 ingestion::check_new_emails(
                     &db,
                     &client_secret_path,
-                    &base_dir,
+                    &token_dir,
                     fetch_since.as_deref(),
                 ).await
             })),
@@ -609,53 +807,109 @@ pub async fn check_new_emails(
 /// Opens a browser for the user to authorize, then stores the account in the DB.
 #[tauri::command]
 pub async fn add_account(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let db = Arc::clone(&state.db);
     let client_secret_path = state.client_secret_path.clone();
+    let token_dir = state.token_dir.clone();
+    let app_handle = app.clone();
+
+    // Set up cancellation channel so the frontend can abort the flow
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut guard = state.auth_cancel.lock().map_err(|e| e.to_string())?;
+        *guard = Some(cancel_tx);
+    }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let result = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(async {
-                let (email, token_path) = auth::authenticate_new_account(&client_secret_path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                // Check if account already exists
-                if let Some(existing) = db.get_account_by_email(&email).await.map_err(|e| e.to_string())? {
-                    if existing.is_active {
-                        return Ok(email);
+                // Create a delegate that opens the auth URL via Tauri's opener plugin
+                // and emits the URL to the frontend for copy/re-open functionality
+                let app_for_delegate = app_handle.clone();
+                let delegate = CallbackFlowDelegate::new(move |url: &str| {
+                    let _ = app_for_delegate.emit("auth-url", url.to_string());
+                    use tauri_plugin_opener::OpenerExt;
+                    if let Err(e) = app_for_delegate.opener().open_url(url, None::<&str>) {
+                        tracing::warn!("Failed to open auth URL via opener plugin: {}", e);
                     }
-                    // Reactivate deactivated account
-                    sqlx::query("UPDATE accounts SET is_active = 1, token_cache_path = ? WHERE email = ?")
-                        .bind(token_path.to_string_lossy().to_string())
-                        .bind(&email)
-                        .execute(db.pool())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    return Ok(email);
-                }
+                });
 
-                let token_path_str = token_path.to_string_lossy().to_string();
-                db.add_account(&email, &token_path_str).await.map_err(|e| e.to_string())?;
+                // Race auth flow against cancellation
+                tokio::select! {
+                    result = auth::authenticate_new_account(
+                        &client_secret_path,
+                        Some(Box::new(delegate)),
+                        &token_dir,
+                    ) => {
+                        let (email, token_path) = result.map_err(|e| e.to_string())?;
 
-                // Fetch and store profile picture
-                let account_auth = AccountAuth::with_path(&email, token_path);
-                if let Ok(Some(pic_url)) = fetch_profile_picture_url(&client_secret_path, &account_auth).await {
-                    if let Ok(Some(acc)) = db.get_account_by_email(&email).await {
-                        let _ = db.update_account_profile_picture(acc.id, Some(&pic_url)).await;
+                        // Check if account already exists
+                        if let Some(existing) = db.get_account_by_email(&email).await.map_err(|e| e.to_string())? {
+                            if existing.is_active {
+                                return Ok(email);
+                            }
+                            // Reactivate deactivated account
+                            sqlx::query("UPDATE accounts SET is_active = 1, token_cache_path = ? WHERE email = ?")
+                                .bind(token_path.to_string_lossy().to_string())
+                                .bind(&email)
+                                .execute(db.pool())
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            return Ok(email);
+                        }
+
+                        let token_path_str = token_path.to_string_lossy().to_string();
+                        db.add_account(&email, &token_path_str).await.map_err(|e| e.to_string())?;
+
+                        // Fetch and store profile picture
+                        let account_auth = AccountAuth::with_path(&email, token_path);
+                        if let Ok(Some(pic_url)) = fetch_profile_picture_url(&client_secret_path, &account_auth).await {
+                            if let Ok(Some(acc)) = db.get_account_by_email(&email).await {
+                                let _ = db.update_account_profile_picture(acc.id, Some(&pic_url)).await;
+                            }
+                        }
+
+                        Ok(email)
+                    }
+                    _ = cancel_rx => {
+                        Err("Authentication cancelled".to_string())
                     }
                 }
-
-                Ok(email)
             }),
             Err(e) => Err(format!("Failed to create runtime: {}", e)),
         };
         let _ = tx.send(result);
     });
 
-    rx.await.map_err(|_| "Add account task failed".to_string())?
+    let result = rx.await.map_err(|_| "Add account task failed".to_string())?;
+
+    // Clear cancel sender (may already be None if cancelled)
+    if let Ok(mut guard) = state.auth_cancel.lock() {
+        *guard = None;
+    }
+
+    result
+}
+
+/// Cancel an in-progress OAuth add-account flow.
+#[tauri::command]
+pub async fn cancel_add_account(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cancel_tx = {
+        let mut guard = state.auth_cancel.lock().map_err(|e| e.to_string())?;
+        guard.take()
+    };
+
+    if let Some(tx) = cancel_tx {
+        let _ = tx.send(());
+        Ok(())
+    } else {
+        Ok(()) // No active auth flow — silently succeed
+    }
 }
 
 /// Remove a Gmail account and delete all its data (orders, emails, token cache).
@@ -675,10 +929,15 @@ pub async fn remove_account(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Delete token cache file
-    let token_path = std::path::Path::new(&account.token_cache_path);
-    if token_path.exists() {
-        let _ = std::fs::remove_file(token_path);
+    // Delete token cache file (resolve relative paths against token_dir)
+    let token_path = PathBuf::from(&account.token_cache_path);
+    let resolved_token_path = if token_path.is_absolute() {
+        token_path
+    } else {
+        state.token_dir.join(token_path)
+    };
+    if resolved_token_path.exists() {
+        let _ = std::fs::remove_file(&resolved_token_path);
     }
 
     Ok(format!("Removed {} ({} orders, {} emails deleted)", account.email, orders, emails))

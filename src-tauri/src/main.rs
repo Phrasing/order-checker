@@ -108,6 +108,14 @@ fn main() {
 
             tracing::info!("Using client_secret: {}", client_secret_path.display());
 
+            // Determine token cache directory — use app data dir so token files
+            // don't land in the project tree (which would trigger the Tauri dev file watcher).
+            let token_dir = app.path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            std::fs::create_dir_all(&token_dir).ok();
+            tracing::info!("Using token dir: {}", token_dir.display());
+
             // Ensure parent directory exists (synchronous, before async DB init)
             if let Some(parent) = db_path.parent() {
                 let parent: &Path = parent;
@@ -136,7 +144,7 @@ fn main() {
 
             let db_for_email_check = Arc::clone(&db);
             let client_secret_for_check = client_secret_path.clone();
-            let db_path_for_check = db_path.clone();
+            let token_dir_for_check = token_dir.clone();
             let app_handle_for_check = app.handle().clone();
 
             app.manage(AppState {
@@ -144,6 +152,8 @@ fn main() {
                 db_path,
                 client_secret_path,
                 tracking_service,
+                token_dir,
+                auth_cancel: std::sync::Mutex::new(None),
             });
 
             // Spawn background tracking fetch task
@@ -192,15 +202,10 @@ fn main() {
 
                 tracing::info!("Starting background new-email check...");
 
-                let base_dir = db_path_for_check
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .to_path_buf();
-
                 let check = walmart_dashboard::ingestion::check_new_emails(
                     &db_for_email_check,
                     &client_secret_for_check,
-                    &base_dir,
+                    &token_dir_for_check,
                     None, // No fetchSince at startup; frontend will re-check with user's date
                 )
                 .await;
@@ -214,6 +219,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard,
+            commands::get_dashboard_v2,
+            commands::fetch_more_orders,
+            commands::search_orders,
+            commands::get_aggregate_stats,
             commands::get_db_path,
             commands::get_tracking_status,
             commands::fetch_tracking,
@@ -225,13 +234,16 @@ fn main() {
             commands::sync_and_process_orders,
             commands::check_new_emails,
             commands::add_account,
+            commands::cancel_add_account,
             commands::remove_account,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                // Clean up tracking service on exit (closes Chrome browser)
+                // Clean up tracking service on exit.
+                // With V8 architecture, .close() is a no-op (no persistent browser).
+                // This mainly drops the HTTP client and local state.
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     tracing::info!("Application exiting, cleaning up...");
                     tauri::async_runtime::block_on(async {

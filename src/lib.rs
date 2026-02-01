@@ -35,7 +35,7 @@ pub mod web;
 pub use models::{ItemStatus, LineItem, OrderStatus, WalmartOrder};
 pub use parsing::WalmartEmailParser;
 pub use ingestion::{sync_emails_with_days, GmailFetcher, SyncStats};
-pub use process::{process_pending_events, ProcessStats};
+pub use process::{process_pending_events, process_pending_events_concurrent, IngestionDoneFlag, ProcessStats};
 
 // Re-export web module types for Tauri
 pub use web::{OrderViewModel, ItemViewModel, StatusCounts, DashboardData, get_dashboard_data};

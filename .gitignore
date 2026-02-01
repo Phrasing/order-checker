@@ -3,8 +3,9 @@
 /src-tauri/target/
 Cargo.lock
 
-# Tauri
+# Tauri / Vite
 /dist/
+/frontend/dist/
 /node_modules/
 
 # IDE

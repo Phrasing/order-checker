@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use sqlx::Row;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use tracing_appender::rolling;
@@ -56,6 +57,29 @@ enum Commands {
         /// Reset skipped/failed emails to pending before processing
         #[arg(long)]
         reset: bool,
+    },
+
+    /// Sync emails and process them concurrently (pipelined)
+    SyncAndProcess {
+        /// Path to Google OAuth client_secret.json
+        #[arg(long, default_value = "client_secret.json")]
+        client_secret: PathBuf,
+
+        /// Path to cache OAuth tokens (legacy, ignored if accounts are configured)
+        #[arg(long, default_value = "token_cache.json")]
+        token_cache: PathBuf,
+
+        /// Custom search query (optional, defaults to Walmart emails)
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Only fetch emails from the last N days (default: 5)
+        #[arg(long, short = 'n', default_value = "5")]
+        days: u32,
+
+        /// Sync only this specific account (email address)
+        #[arg(long)]
+        account: Option<String>,
     },
 
     /// Show sync status and database statistics
@@ -364,6 +388,141 @@ async fn main() -> Result<()> {
             println!("\n{}", order_status);
         }
 
+        Commands::SyncAndProcess {
+            client_secret,
+            token_cache: _,
+            query,
+            days,
+            account,
+        } => {
+            let db = Database::from_file(&db_path).await?;
+            db.run_migrations().await?;
+
+            // Get accounts to sync
+            let accounts_to_sync = if let Some(email) = account {
+                match db.get_account_by_email(&email).await? {
+                    Some(acc) if acc.is_active => vec![acc],
+                    Some(_) => {
+                        println!("Account {} is deactivated.", email);
+                        return Ok(());
+                    }
+                    None => {
+                        println!("Account {} not found. Run 'add-account' first.", email);
+                        return Ok(());
+                    }
+                }
+            } else {
+                db.list_accounts().await?
+            };
+
+            if accounts_to_sync.is_empty() {
+                println!("No accounts configured. Use 'add-account' first, or use separate 'sync' + 'process' commands for legacy mode.");
+                return Ok(());
+            }
+
+            let num_accounts = accounts_to_sync.len();
+            let db = Arc::new(db);
+            let ingestion_done = Arc::new(AtomicBool::new(false));
+
+            // Spawn processing task — starts immediately, processes emails as they arrive
+            let db_process = db.clone();
+            let ingestion_done_clone = ingestion_done.clone();
+            let process_handle = tokio::spawn(async move {
+                process::process_pending_events_concurrent(&db_process, Some(ingestion_done_clone)).await
+            });
+
+            // Sync all accounts in parallel
+            println!("Syncing {} account(s) in parallel and processing concurrently...", num_accounts);
+
+            let client_secret = Arc::new(client_secret);
+            let query = Arc::new(query);
+            let mut sync_handles = tokio::task::JoinSet::new();
+
+            for acc in accounts_to_sync {
+                let db = db.clone();
+                let client_secret = client_secret.clone();
+                let query = query.clone();
+
+                sync_handles.spawn(async move {
+                    println!("\n=== Syncing account: {} ===", acc.email);
+
+                    let account_auth = AccountAuth::with_path(
+                        &acc.email,
+                        PathBuf::from(&acc.token_cache_path),
+                    );
+
+                    match auth::get_gmail_client_for_account(&client_secret, &account_auth).await {
+                        Ok(gmail_client) => {
+                            println!("Starting email sync (last {} days) for {}...", days, acc.email);
+                            let stats = if let Some(ref custom_query) = *query {
+                                ingestion::sync_emails_with_query_and_account(
+                                    &db, gmail_client, custom_query, acc.id, None,
+                                ).await
+                            } else {
+                                ingestion::sync_emails_with_days_and_account(
+                                    &db, gmail_client, days, acc.id, None,
+                                ).await
+                            };
+
+                            match stats {
+                                Ok(stats) => {
+                                    println!("{}", stats.summary());
+                                    db.update_account_last_sync(acc.id).await.ok();
+                                    Ok((stats.total_fetched, stats.new_emails))
+                                }
+                                Err(e) => Err(format!("Sync failed for {}: {}", acc.email, e))
+                            }
+                        }
+                        Err(e) => {
+                            Err(format!("Failed to authenticate {}: {}. Run 'clear-account-auth {}' and try again.", acc.email, e, acc.email))
+                        }
+                    }
+                });
+            }
+
+            // Collect results from all sync tasks
+            let mut total_fetched = 0usize;
+            let mut total_inserted = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+
+            while let Some(result) = sync_handles.join_next().await {
+                match result {
+                    Ok(Ok((fetched, inserted))) => {
+                        total_fetched += fetched;
+                        total_inserted += inserted;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("{}", e);
+                        errors.push(e);
+                    }
+                    Err(e) => {
+                        let msg = format!("Sync task panicked: {}", e);
+                        eprintln!("{}", msg);
+                        errors.push(msg);
+                    }
+                }
+            }
+
+            // Signal ingestion complete
+            ingestion_done.store(true, Ordering::Release);
+
+            println!("\n=== Sync Complete ===");
+            println!("  Accounts synced: {}", num_accounts);
+            println!("  Total fetched: {}", total_fetched);
+            println!("  Total new: {}", total_inserted);
+            if !errors.is_empty() {
+                println!("  Errors: {}", errors.len());
+            }
+
+            // Wait for processing to finish draining
+            println!("\nWaiting for processing to finish...");
+            let process_stats = process_handle.await??;
+            println!("\n{}", process_stats.summary());
+
+            let order_status = get_order_status(&db).await?;
+            println!("\n{}", order_status);
+        }
+
         Commands::DebugEmail { id, event_type: filter_type } => {
             let db = Database::from_file(&db_path).await?;
             db.run_migrations().await?;
@@ -456,35 +615,14 @@ async fn main() -> Result<()> {
                 .execute(db.pool())
                 .await?;
 
-            // Reset all emails to pending
-            let _emails_reset = db.reset_email_status().await?;
+            // Also clear raw_emails — bodies are wiped after processing so
+            // resetting to pending is useless; they must be re-fetched from Gmail.
+            let emails_result = sqlx::query("DELETE FROM raw_emails")
+                .execute(db.pool())
+                .await?;
 
-            // Also reset "processed" emails to "pending"
-            let processed_reset = sqlx::query(
-                "UPDATE raw_emails SET processing_status = 'pending', error_message = NULL, processed_at = NULL WHERE processing_status = 'processed'"
-            )
-            .execute(db.pool())
-            .await?;
-
-            // Re-infer event_type based on subject patterns (fixes classification for "Thanks for your order" emails)
-            sqlx::query(
-                r#"
-                UPDATE raw_emails SET event_type =
-                    CASE
-                        WHEN LOWER(subject) LIKE '%confirmed%' OR LOWER(subject) LIKE '%confirmation%' OR LOWER(subject) LIKE '%thanks for your%' THEN 'confirmation'
-                        WHEN LOWER(subject) LIKE '%cancel%' THEN 'cancellation'
-                        WHEN LOWER(subject) LIKE '%shipped%' OR LOWER(subject) LIKE '%on its way%' THEN 'shipping'
-                        WHEN LOWER(subject) LIKE '%delivered%' OR LOWER(subject) LIKE '%arrived%' THEN 'delivery'
-                        ELSE event_type
-                    END
-                "#
-            )
-            .execute(db.pool())
-            .await?;
-
-            println!("Cleared {} orders and {} line items", orders_result.rows_affected(), items_result.rows_affected());
-            println!("Reset {} processed emails to pending", processed_reset.rows_affected());
-            println!("Run 'process' to reprocess emails with updated parsing logic");
+            println!("Cleared {} orders, {} line items, {} emails", orders_result.rows_affected(), items_result.rows_affected(), emails_result.rows_affected());
+            println!("Run 'sync' to re-fetch and reprocess emails from Gmail");
         }
 
         Commands::BackfillThumbnails { force } => {
@@ -817,8 +955,11 @@ async fn main() -> Result<()> {
             println!("Adding a new Gmail account...");
             println!("A browser window will open for authentication.\n");
 
+            // Store token files alongside the database
+            let token_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+
             // Trigger OAuth flow and get email
-            let (email, token_path) = auth::authenticate_new_account(&client_secret).await?;
+            let (email, token_path) = auth::authenticate_new_account(&client_secret, None, token_dir).await?;
 
             // Check if account already exists
             if let Some(existing) = db.get_account_by_email(&email).await? {

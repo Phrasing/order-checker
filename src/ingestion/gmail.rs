@@ -19,7 +19,7 @@ use tokio::time::sleep;
 /// Matches: order confirmations, cancellations, shipping updates, delivery/arrival
 /// Uses "from:walmart" to match both walmart.com and help@walmart.com
 const WALMART_BASE_QUERY: &str =
-    "from:walmart subject:(order OR preorder OR canceled OR cancelled OR delivery OR delivered OR shipped OR delayed OR confirmed OR confirmation OR arrived)";
+    "from:walmart subject:(order OR preorder OR canceled OR cancelled OR delivery OR delivered OR shipped OR delayed OR confirmed OR confirmation OR arrived) -subject:\"Ready to complete your order\"";
 
 const MAX_FETCH_RETRIES: usize = 4;
 const FETCH_BASE_DELAY_MS: u64 = 500;
@@ -430,7 +430,12 @@ fn status_from_error(error: &anyhow::Error) -> Option<StatusCode> {
     None
 }
 
-/// Infer email event type from subject or snippet
+/// Infer email event type from subject or snippet.
+///
+/// Priority: cancellation → delivery → shipping → confirmation
+/// Specific types are checked first because confirmation-like text ("confirmed",
+/// "thanks for your order") can appear across many email types.
+/// "tracking" is NOT checked — it appears in URLs across ALL Walmart email types.
 pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'static str {
     let combined = format!(
         "{} {}",
@@ -438,14 +443,18 @@ pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'stati
         snippet.unwrap_or("")
     ).to_lowercase();
 
-    if combined.contains("confirmed") || combined.contains("confirmation") || combined.contains("order placed") || combined.contains("thanks for your") {
-        "confirmation"
-    } else if combined.contains("cancel") {
+    if combined.contains("cancel") {
         "cancellation"
-    } else if combined.contains("shipped") || combined.contains("on its way") || combined.contains("tracking") {
-        "shipping"
-    } else if combined.contains("delivered") || combined.contains("has arrived") {
+    } else if combined.contains("delivered") || combined.contains("has arrived")
+        || combined.contains("arrived")
+    {
         "delivery"
+    } else if combined.contains("shipped") || combined.contains("on its way") {
+        "shipping"
+    } else if combined.contains("confirmed") || combined.contains("confirmation")
+        || combined.contains("order placed") || combined.contains("thanks for your order")
+    {
+        "confirmation"
     } else if combined.contains("delay") {
         "delay"
     } else {
@@ -454,7 +463,7 @@ pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'stati
 }
 
 /// Recursively find the first text/html part in the MIME structure
-fn find_html_part(parsed: &mailparse::ParsedMail) -> Option<String> {
+pub(crate) fn find_html_part(parsed: &mailparse::ParsedMail) -> Option<String> {
     if parsed.ctype.mimetype == "text/html" {
         return parsed.get_body().ok();
     }

@@ -1,0 +1,21 @@
+[2m2026-02-01T04:16:56.506012Z[0m [32m INFO[0m Using database: orders.db
+[2m2026-02-01T04:16:56.537636Z[0m [32m INFO[0m Removed duplicate email_events [3mcount[0m[2m=[0m399
+[2m2026-02-01T04:16:56.537664Z[0m [32m INFO[0m All database migrations completed successfully
+Processing pending emails...
+[2m2026-02-01T04:16:56.537831Z[0m [32m INFO[0m No pending emails to process
+[2m2026-02-01T04:16:56.537842Z[0m [32m INFO[0m Processing complete: 0 pending, 0 processed, 0 skipped, 0 failed in 0ms
+[2m2026-02-01T04:16:56.537847Z[0m [32m INFO[0m Processing complete: 0 batches in 0ms
+[2m2026-02-01T04:16:56.538839Z[0m [32m INFO[0m Orders in database after processing: 2530
+
+Processing complete: 0 pending, 0 processed, 0 skipped, 0 failed in 0ms
+
+Order status:
+  Total orders: 2530
+  canceled: 2025
+  confirmed: 4
+  delivered: 351
+  partially_canceled: 1
+  shipped: 149
+
+  With total: 2520
+  Missing total: 10 (no confirmation email)

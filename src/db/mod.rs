@@ -23,10 +23,12 @@ impl Database {
         let options = SqliteConnectOptions::from_str(database_url)?
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(30))
-            .pragma("foreign_keys", "ON");
+            .pragma("foreign_keys", "ON")
+            .pragma("synchronous", "NORMAL")
+            .pragma("cache_size", "-8000");
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(8)
             .connect_with(options)
             .await?;
 
@@ -45,10 +47,12 @@ impl Database {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(30))
-            .pragma("foreign_keys", "ON");
+            .pragma("foreign_keys", "ON")
+            .pragma("synchronous", "NORMAL")
+            .pragma("cache_size", "-8000");
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(8)
             .connect_with(options)
             .await?;
 
@@ -102,6 +106,7 @@ impl Database {
             "ALTER TABLE accounts ADD COLUMN profile_picture_url TEXT",
             "ALTER TABLE raw_emails ADD COLUMN recipient TEXT",
             "ALTER TABLE orders ADD COLUMN recipient TEXT",
+            "ALTER TABLE orders ADD COLUMN cancel_reason TEXT",
         ];
         for sql in optional_columns {
             match sqlx::query(sql).execute(&self.pool).await {
@@ -428,35 +433,42 @@ impl Database {
         Ok(result.last_insert_rowid())
     }
 
-    /// Batch insert raw emails using a transaction
+    /// Batch insert raw emails using a transaction with multi-row INSERT
     pub async fn insert_raw_emails_batch(&self, emails: &[EmailData]) -> Result<usize> {
         if emails.is_empty() {
             return Ok(0);
         }
 
         let mut tx = self.pool.begin().await?;
-        let mut inserted = 0;
+        let mut inserted = 0usize;
 
-        for email in emails {
-            let result = sqlx::query(
-                "INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(&email.gmail_id)
-            .bind(&email.thread_id)
-            .bind(&email.subject)
-            .bind(&email.snippet)
-            .bind(&email.sender)
-            .bind(&email.recipient)
-            .bind(&email.raw_body)
-            .bind(&email.event_type)
-            .bind(&email.gmail_date)
-            .execute(&mut *tx)
-            .await?;
+        // 9 columns per row, SQLite limit 999 → max 111 rows per statement
+        const MAX_ROWS: usize = 100;
 
-            if result.rows_affected() > 0 {
-                inserted += 1;
+        for chunk in emails.chunks(MAX_ROWS) {
+            let row_placeholder = "(?,?,?,?,?,?,?,?,?)";
+            let placeholders: Vec<&str> = chunk.iter().map(|_| row_placeholder).collect();
+            let sql = format!(
+                "INSERT OR IGNORE INTO raw_emails \
+                 (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date) \
+                 VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut query = sqlx::query(&sql);
+            for email in chunk {
+                query = query
+                    .bind(&email.gmail_id)
+                    .bind(&email.thread_id)
+                    .bind(&email.subject)
+                    .bind(&email.snippet)
+                    .bind(&email.sender)
+                    .bind(&email.recipient)
+                    .bind(&email.raw_body)
+                    .bind(&email.event_type)
+                    .bind(&email.gmail_date);
             }
+            let result = query.execute(&mut *tx).await?;
+            inserted += result.rows_affected() as usize;
         }
 
         tx.commit().await?;
@@ -704,7 +716,7 @@ impl Database {
         Ok(existing)
     }
 
-    /// Batch insert raw emails with account_id
+    /// Batch insert raw emails with account_id using multi-row INSERT
     pub async fn insert_raw_emails_batch_with_account(
         &self,
         account_id: i64,
@@ -715,29 +727,36 @@ impl Database {
         }
 
         let mut tx = self.pool.begin().await?;
-        let mut inserted = 0;
+        let mut inserted = 0usize;
 
-        for email in emails {
-            let result = sqlx::query(
-                "INSERT OR IGNORE INTO raw_emails (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date, account_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&email.gmail_id)
-            .bind(&email.thread_id)
-            .bind(&email.subject)
-            .bind(&email.snippet)
-            .bind(&email.sender)
-            .bind(&email.recipient)
-            .bind(&email.raw_body)
-            .bind(&email.event_type)
-            .bind(&email.gmail_date)
-            .bind(account_id)
-            .execute(&mut *tx)
-            .await?;
+        // 10 columns per row, SQLite limit 999 → max 99 rows per statement
+        const MAX_ROWS: usize = 90;
 
-            if result.rows_affected() > 0 {
-                inserted += 1;
+        for chunk in emails.chunks(MAX_ROWS) {
+            let row_placeholder = "(?,?,?,?,?,?,?,?,?,?)";
+            let placeholders: Vec<&str> = chunk.iter().map(|_| row_placeholder).collect();
+            let sql = format!(
+                "INSERT OR IGNORE INTO raw_emails \
+                 (gmail_id, thread_id, subject, snippet, sender, recipient, raw_body, event_type, gmail_date, account_id) \
+                 VALUES {}",
+                placeholders.join(", ")
+            );
+            let mut query = sqlx::query(&sql);
+            for email in chunk {
+                query = query
+                    .bind(&email.gmail_id)
+                    .bind(&email.thread_id)
+                    .bind(&email.subject)
+                    .bind(&email.snippet)
+                    .bind(&email.sender)
+                    .bind(&email.recipient)
+                    .bind(&email.raw_body)
+                    .bind(&email.event_type)
+                    .bind(&email.gmail_date)
+                    .bind(account_id);
             }
+            let result = query.execute(&mut *tx).await?;
+            inserted += result.rows_affected() as usize;
         }
 
         tx.commit().await?;
