@@ -2,6 +2,10 @@
 
 A desktop app that syncs Walmart order emails from Gmail, parses them, and displays everything in a local dashboard. Built with Tauri (Rust backend + TypeScript frontend).
 
+<p align="center">
+  <img src="screenshot.png" alt="Walmart Order Dashboard" width="900">
+</p>
+
 ## What it does
 
 - Connects to Gmail accounts via OAuth2 and pulls Walmart order/shipping/delivery emails
