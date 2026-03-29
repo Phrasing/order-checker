@@ -20,9 +20,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use thiserror::Error;
 
-/// Maximum depth to walk up DOM tree when searching for parent row elements
-/// Reduced from 10 to 5 for better performance - typical matches are at depth 2-3
-const MAX_ANCESTRY_DEPTH: usize = 5;
+/// Maximum depth to walk up DOM tree when searching for parent row elements.
+/// Store delivery emails have deeply nested tables (span → td → tr → table → td → tr)
+/// requiring depth 5-6. Using 8 for safety margin.
+const MAX_ANCESTRY_DEPTH: usize = 8;
 
 /// Cached fallback regex for order ID extraction (compiled once)
 fn fallback_order_id_pattern() -> &'static Regex {
@@ -85,6 +86,22 @@ fn alt_item_pattern() -> &'static Regex {
     })
 }
 
+/// Matches an `<img ...>` or `<img ... />` tag (non-greedy).
+fn img_tag_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?is)<img\s[^>]*?>").expect("Invalid img tag regex")
+    })
+}
+
+/// Extracts the value of a `src` attribute from an HTML tag fragment.
+fn src_attr_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"src\s*=\s*["']([^"']+)["']"#).expect("Invalid src attr regex")
+    })
+}
+
 fn alt_item_text_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
@@ -142,7 +159,7 @@ fn img_selector() -> Option<&'static Selector> {
 
 fn class_scan_selector() -> Option<&'static Selector> {
     static SELECTOR: OnceLock<Option<Selector>> = OnceLock::new();
-    SELECTOR.get_or_init(|| Selector::parse("div, span, td").ok()).as_ref()
+    SELECTOR.get_or_init(|| Selector::parse("[class]").ok()).as_ref()
 }
 
 #[derive(Error, Debug)]
@@ -170,6 +187,28 @@ pub enum EmailType {
     Unknown,
 }
 
+/// Case-insensitive byte search for ASCII needles. O(n*m) but fast for short needles.
+/// Both haystack and needle are compared byte-by-byte with ASCII lowercasing.
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    let needle_len = needle_bytes.len();
+    if needle_len > haystack.len() {
+        return None;
+    }
+    let haystack_bytes = haystack.as_bytes();
+    'outer: for pos in 0..=(haystack_bytes.len() - needle_len) {
+        for offset in 0..needle_len {
+            if haystack_bytes[pos + offset].to_ascii_lowercase()
+                != needle_bytes[offset].to_ascii_lowercase()
+            {
+                continue 'outer;
+            }
+        }
+        return Some(pos);
+    }
+    None
+}
+
 /// Parser for Walmart order emails
 pub struct WalmartEmailParser;
 
@@ -183,7 +222,6 @@ struct ParseContext<'a> {
     html: &'a str,
     lower: String,
     document: Html,
-    // Note: p13n filtering is now done via is_in_p13n_section() helper during element iteration
 }
 
 impl WalmartEmailParser {
@@ -193,14 +231,27 @@ impl WalmartEmailParser {
 
     /// Detect the type of email based on content
     pub fn detect_email_type(&self, html: &str) -> EmailType {
-        let lower = html.to_lowercase();
-        self.detect_email_type_lower(&lower)
+        self.detect_email_type_raw(html)
     }
 
     /// Detect email type from subject line alone (high-confidence, short text).
     /// Returns `None` if the subject is inconclusive.
+    /// Returns `Some(Unknown)` for known non-order emails to prevent HTML fallback
+    /// from misclassifying promotional or membership content.
     pub fn detect_email_type_from_subject(&self, subject: &str) -> Option<EmailType> {
         let lower = subject.to_lowercase();
+
+        // Non-order emails — return Unknown to prevent HTML body fallback misclassification.
+        // Membership notices (e.g. "Your Walmart+ membership was canceled") contain "cancel"
+        // but aren't order cancellations. Promotional emails (e.g. "Get free delivery with
+        // code EXPRESS") contain delivery-adjacent keywords but aren't delivery notifications.
+        if lower.contains("membership") || lower.contains("walmart+") {
+            return Some(EmailType::Unknown);
+        }
+        if lower.contains("free delivery") || lower.contains("promo code") {
+            return Some(EmailType::Unknown);
+        }
+
         if lower.contains("cancel") {
             return Some(EmailType::Cancellation);
         }
@@ -211,11 +262,62 @@ impl WalmartEmailParser {
             return Some(EmailType::Shipping);
         }
         if lower.contains("confirmed") || lower.contains("confirmation")
+            || lower.contains("thanks for your delivery order")
             || lower.contains("thanks for your order")
         {
             return Some(EmailType::Confirmation);
         }
         None
+    }
+
+    /// Detect email type from raw HTML without any allocation.
+    ///
+    /// Uses case-insensitive byte search (`find_case_insensitive`) so the full
+    /// 100-200KB email can be scanned without a `to_lowercase()` copy.
+    /// Same priority order as `detect_email_type_lower`.
+    pub(crate) fn detect_email_type_raw(&self, html: &str) -> EmailType {
+        // 0. Promotional/marketing emails — Walmart campaign emails contain
+        //    `<!-- Campaign: BAT-... -->` HTML comments. These often include delivery
+        //    keywords ("delivered to your door") that would otherwise misclassify them.
+        if find_case_insensitive(html, "<!-- campaign:").is_some() {
+            return EmailType::Unknown;
+        }
+
+        // 1. Cancellation
+        if find_case_insensitive(html, "order cancel").is_some()
+            || find_case_insensitive(html, "item cancel").is_some()
+            || find_case_insensitive(html, "been canceled").is_some()
+            || find_case_insensitive(html, "was canceled").is_some()
+            || find_case_insensitive(html, "is canceled").is_some()
+            || find_case_insensitive(html, "delivery canceled").is_some()
+            || find_case_insensitive(html, "has been cancelled").is_some()
+            || find_case_insensitive(html, "was cancelled").is_some()
+        {
+            EmailType::Cancellation
+        // 2. Delivery — require delivery-specific phrases, not bare "delivered" which
+        //    matches promotional copy like "Get items delivered" or "free delivery".
+        } else if find_case_insensitive(html, "has been delivered").is_some()
+            || find_case_insensitive(html, "was delivered").is_some()
+            || find_case_insensitive(html, "delivered to").is_some()
+            || find_case_insensitive(html, "order delivered").is_some()
+            || find_case_insensitive(html, "package delivered").is_some()
+            || find_case_insensitive(html, "has arrived").is_some()
+            || find_case_insensitive(html, "package arrived").is_some()
+            || find_case_insensitive(html, "item arrived").is_some()
+        {
+            EmailType::Delivery
+        } else if find_case_insensitive(html, "shipped").is_some()
+            || find_case_insensitive(html, "on its way").is_some()
+        {
+            EmailType::Shipping
+        } else if find_case_insensitive(html, "order confirmed").is_some()
+            || find_case_insensitive(html, "order confirmation").is_some()
+            || find_case_insensitive(html, "thanks for your order").is_some()
+        {
+            EmailType::Confirmation
+        } else {
+            EmailType::Unknown
+        }
     }
 
     /// Detect email type from full HTML body (lower-confidence fallback).
@@ -224,7 +326,14 @@ impl WalmartEmailParser {
     /// Specific types are checked first because generic confirmation-like text
     /// ("order confirmation", "thanks for your order") often appears in footer
     /// links and boilerplate across ALL email types.
-    fn detect_email_type_lower(&self, lower: &str) -> EmailType {
+    pub(crate) fn detect_email_type_lower(&self, lower: &str) -> EmailType {
+        // 0. Promotional/marketing emails — Walmart campaign emails contain
+        //    `<!-- campaign: bat-...` markers (already lowered). Skip before
+        //    keyword matching to prevent misclassification.
+        if lower.contains("<!-- campaign:") {
+            return EmailType::Unknown;
+        }
+
         // 1. Cancellation — most specific keywords
         if lower.contains("order cancel")
             || lower.contains("item cancel")
@@ -236,9 +345,14 @@ impl WalmartEmailParser {
             || lower.contains("was cancelled")
         {
             EmailType::Cancellation
-        // 2. Delivery — past-tense / arrival markers, checked before shipping
-        //    (delivery emails often contain "Sold and shipped by Walmart")
-        } else if lower.contains("delivered")
+        // 2. Delivery — require delivery-specific phrases, not bare "delivered"
+        //    which matches promotional copy (delivery emails also contain
+        //    "Sold and shipped by Walmart", so shipping check must follow)
+        } else if lower.contains("has been delivered")
+            || lower.contains("was delivered")
+            || lower.contains("delivered to")
+            || lower.contains("order delivered")
+            || lower.contains("package delivered")
             || lower.contains("has arrived")
             || lower.contains("package arrived")
             || lower.contains("item arrived")
@@ -352,21 +466,56 @@ impl WalmartEmailParser {
         Err(ParseError::DateParseError(date_str.to_string()))
     }
 
-    fn build_context<'a>(&self, html: &'a str) -> ParseContext<'a> {
-        let lower = html.to_lowercase();
+    /// Find the byte offset where `<body` begins (or 0 if not found).
+    /// Skipping `<head>` content avoids tokenizing ~24% of the HTML (CSS/styles)
+    /// that is never queried during extraction.
+    fn body_start_offset(html: &str) -> usize {
+        let bytes = html.as_bytes();
+        let len = bytes.len();
+        for pos in 0..len.saturating_sub(5) {
+            if bytes[pos] == b'<'
+                && bytes[pos + 1].to_ascii_lowercase() == b'b'
+                && bytes[pos + 2].to_ascii_lowercase() == b'o'
+                && bytes[pos + 3].to_ascii_lowercase() == b'd'
+                && bytes[pos + 4].to_ascii_lowercase() == b'y'
+            {
+                return pos;
+            }
+        }
+        0 // no <body> tag found — use full HTML
+    }
 
-        // Parse HTML once (eliminates 50% of DOM parsing overhead)
-        // p13n filtering is now done via is_in_p13n_section() during element iteration
-        let document = Html::parse_document(html);
+    fn build_context<'a>(&self, html: &'a str) -> ParseContext<'a> {
+        let _span = tracing::debug_span!("build_context", html_len = html.len()).entered();
+
+        // Strip <head> section — CSS/styles generate DOM nodes that are
+        // tokenized and tree-built but never queried. All extraction operates
+        // on <body> content.
+        let body_html = &html[Self::body_start_offset(html)..];
+        let lower = body_html.to_lowercase();
+
+        let document = {
+            let _dom_span = tracing::debug_span!("html_parse_document").entered();
+            Html::parse_document(body_html)
+        };
 
         ParseContext {
-            html,
+            html: body_html,
             lower,
             document,
         }
     }
 
-    fn recommendations_cutoff(lower_html: &str, html_len: usize) -> usize {
+    /// Find the byte offset of the earliest p13n/recommendation marker in the HTML.
+    ///
+    /// Everything after this offset is promotional content (recommended products,
+    /// "continue your shopping", etc.) that we actively filter out during extraction.
+    /// Truncating the HTML here before DOM parsing eliminates 60-80% of the document
+    /// and removes the need for expensive ancestor walks.
+    ///
+    /// Uses case-insensitive byte search on the original HTML to avoid a full
+    /// `to_lowercase()` allocation just for cutoff detection.
+    fn recommendations_cutoff(html: &str) -> usize {
         let p13n_markers = [
             "automation-id=\"p13n-module\"",
             "automation-id='p13n-module'",
@@ -378,54 +527,31 @@ impl WalmartEmailParser {
             "continueyourshopping",
         ];
 
-        let mut earliest_pos = html_len;
+        let mut earliest_pos = html.len();
         for marker in p13n_markers {
-            if let Some(pos) = lower_html.find(marker) {
+            if let Some(pos) = find_case_insensitive(html, marker) {
                 if pos < earliest_pos {
                     earliest_pos = pos;
                 }
             }
         }
 
-        earliest_pos
-    }
-
-    /// Check if an element is likely in the p13n (recommendations) section
-    /// by examining its attributes and ancestor attributes
-    fn is_in_p13n_section(element: &ElementRef) -> bool {
-        // Check the element itself and up to 5 ancestors
-        let mut current = Some(element.clone());
-        for _ in 0..5 {
-            if let Some(elem) = current {
-                // Check automation-id
-                if let Some(auto_id) = elem.value().attr("automation-id") {
-                    if auto_id.contains("p13n") {
-                        return true;
-                    }
-                }
-
-                // Check class attribute
-                if let Some(class) = elem.value().attr("class") {
-                    let class_lower = class.to_lowercase();
-                    if class_lower.contains("p13n")
-                        || class_lower.contains("recommendation")
-                        || class_lower.contains("continueyourshopping") {
-                        return true;
-                    }
-                }
-
-                // Move to parent
-                current = elem.parent().and_then(ElementRef::wrap);
-            } else {
-                break;
+        // Walk backward to the last `>` that closes a complete tag, so we
+        // never leave a partial/unclosed tag that html5ever might misinterpret.
+        if earliest_pos < html.len() {
+            let bytes = html.as_bytes();
+            while earliest_pos > 0 && bytes[earliest_pos - 1] != b'>' {
+                earliest_pos -= 1;
             }
         }
-        false
+
+        earliest_pos
     }
 
     /// Extract total price from email
     pub fn extract_total_price(&self, html: &str) -> Option<f64> {
-        let context = self.build_context(html);
+        let cutoff = Self::recommendations_cutoff(html);
+        let context = self.build_context(&html[..cutoff]);
         self.extract_total_price_with_context(&context)
     }
 
@@ -662,7 +788,8 @@ impl WalmartEmailParser {
 
     /// Extract line items from email HTML using fuzzy class matching
     pub fn extract_items(&self, html: &str) -> Vec<LineItem> {
-        let context = self.build_context(html);
+        let cutoff = Self::recommendations_cutoff(html);
+        let context = self.build_context(&html[..cutoff]);
         self.extract_items_with_context(&context)
     }
 
@@ -733,11 +860,6 @@ impl WalmartEmailParser {
         let mut images: HashMap<String, String> = HashMap::with_capacity(50);
 
         for element in document.select(all_selector) {
-            // Skip elements in p13n (recommendations) section
-            if Self::is_in_p13n_section(&element) {
-                continue;
-            }
-
             if let Some(class) = element.value().attr("class") {
                 // Collect products
                 if product_class_pattern().is_match(class) {
@@ -808,10 +930,6 @@ impl WalmartEmailParser {
 
         let mut index_by_name: HashMap<String, usize> = HashMap::new();
         for img in document.select(img_selector) {
-            // Skip elements in p13n (recommendations) section
-            if Self::is_in_p13n_section(&img) {
-                continue;
-            }
             let alt = match img.value().attr("alt") {
                 Some(value) => value.trim(),
                 None => continue,
@@ -889,10 +1007,6 @@ impl WalmartEmailParser {
         };
 
         for element in document.select(all_selector) {
-            // Skip elements in p13n (recommendations) section
-            if Self::is_in_p13n_section(&element) {
-                continue;
-            }
             if let Some(class) = element.value().attr("class") {
                 if !item_name_class_pattern().is_match(class) {
                     continue;
@@ -1015,10 +1129,268 @@ impl WalmartEmailParser {
         items
     }
 
+    /// Extract total price using string scanning only (no DOM parsing).
+    ///
+    /// Implements strategies 2-4 from `extract_total_price_with_context`:
+    /// - "includes all fees" marker
+    /// - "totalchargedclass" marker
+    /// - "order total" / "total:" / "grand total" patterns
+    ///
+    /// Skips strategy 1 (DOM-based `automation-id="order-total"` section) since
+    /// the whole point is to avoid DOM parsing.
+    fn extract_total_price_regex(&self, html: &str) -> Option<f64> {
+        // Strategy 2: "Includes all fees, taxes and discounts"
+        if let Some(pos) = find_case_insensitive(html, "includes all fees") {
+            let end = std::cmp::min(pos + 300, html.len());
+            if let Some(price) = self.extract_first_price(&html[pos..end]) {
+                return Some(price);
+            }
+        }
+
+        // Strategy 3: totalChargedClass
+        if let Some(pos) = find_case_insensitive(html, "totalchargedclass") {
+            let end = std::cmp::min(pos + 200, html.len());
+            if let Some(price) = self.extract_first_price(&html[pos..end]) {
+                return Some(price);
+            }
+        }
+
+        // Strategy 4: "order total", "total:", "grand total"
+        let total_patterns = ["order total", "total:", "grand total", "total amount"];
+        for pattern in total_patterns {
+            if let Some(pos) = find_case_insensitive(html, pattern) {
+                let end = std::cmp::min(pos + 200, html.len());
+                if let Some(price) = self.extract_first_price(&html[pos..end]) {
+                    return Some(price);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract items from `<img alt="quantity N item ...">` patterns directly
+    /// on raw HTML using regex only — no DOM parsing required.
+    ///
+    /// This works because shipping/delivery emails embed item info in img alt
+    /// attributes. After p13n truncation, all remaining alt-text items are
+    /// legitimate order items (no recommendation filtering needed).
+    fn extract_items_from_alt_regex(&self, html: &str) -> Vec<LineItem> {
+        let mut items: Vec<LineItem> = Vec::new();
+        let mut seen_names: HashMap<String, usize> = HashMap::new();
+
+        // Iterate over <img> tags so we can extract both alt (name/qty) and src (image URL)
+        for img_match in img_tag_pattern().find_iter(html) {
+            let tag = img_match.as_str();
+
+            let captures = match alt_item_pattern().captures(tag) {
+                Some(cap) => cap,
+                None => continue,
+            };
+
+            let (Some(qty_match), Some(name_match)) = (captures.get(1), captures.get(2)) else {
+                continue;
+            };
+
+            let quantity: u32 = qty_match.as_str().parse().unwrap_or(1);
+            let raw_name = name_match.as_str().trim();
+
+            if raw_name.is_empty() || raw_name.len() <= 3 {
+                continue;
+            }
+
+            // Decode HTML entities in the name (e.g., &amp; → &)
+            let name = raw_name
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'");
+
+            // Extract image URL from the src attribute of the same <img> tag
+            let image_url = src_attr_pattern()
+                .captures(tag)
+                .and_then(|cap| cap.get(1))
+                .map(|m| m.as_str().to_string())
+                .filter(|src| Self::is_product_image_url(src));
+
+            let key = name.to_ascii_lowercase();
+            if let Some(&existing_idx) = seen_names.get(&key) {
+                // Deduplicate: keep the higher quantity
+                if quantity > items[existing_idx].quantity {
+                    items[existing_idx].quantity = quantity;
+                }
+                // Fill in image if missing from a previous match
+                if items[existing_idx].image_url.is_none() {
+                    items[existing_idx].image_url = image_url;
+                }
+            } else {
+                seen_names.insert(key, items.len());
+                let mut item = LineItem::new(name, quantity);
+                item.image_url = image_url;
+                items.push(item);
+            }
+        }
+
+        items
+    }
+
+    /// Fast path for shipping emails: pure regex/string extraction, no DOM parsing.
+    ///
+    /// Returns `Some(WalmartOrder)` on success, `None` if extraction fails
+    /// (caller should fall back to full `parse_order()` DOM path).
+    ///
+    /// All fields needed by `apply_shipping_tx` are extractable without DOM:
+    /// - order_id → regex
+    /// - tracking + carrier → regex
+    /// - total_cost → string scanning (strategies 2-4)
+    /// - items → alt-text regex on truncated HTML
+    /// - order_date → regex
+    pub fn parse_shipping_fast(
+        &self,
+        html: &str,
+        fallback_date: Option<DateTime<Utc>>,
+    ) -> Option<WalmartOrder> {
+        let _span = tracing::debug_span!("parse_shipping_fast").entered();
+
+        // Truncate at p13n boundary (same as full path)
+        let cutoff = Self::recommendations_cutoff(html);
+        let truncated = &html[..cutoff];
+
+        // Order ID is mandatory
+        let order_id = self.extract_order_id(html).ok()?;
+
+        let order_date = self.extract_order_date(html)
+            .unwrap_or_else(|_| fallback_date.unwrap_or_else(Utc::now));
+
+        let total_cost = self.extract_total_price_regex(truncated);
+        let tracking_info = self.extract_tracking_info(html);
+
+        // Extract items from alt-text patterns on truncated HTML
+        let items: Vec<LineItem> = self
+            .extract_items_from_alt_regex(truncated)
+            .into_iter()
+            .map(|item| item.with_status(ItemStatus::Shipped))
+            .collect();
+
+        let mut order = WalmartOrder::new(&order_id, order_date, OrderStatus::Shipped)
+            .with_items(items);
+
+        if let Some(total) = total_cost {
+            order = order.with_total(total);
+        }
+
+        if let Some((carrier, tracking_number)) = tracking_info {
+            order = order.with_tracking(tracking_number, carrier);
+        }
+
+        Some(order)
+    }
+
+    /// Fast path for delivery emails: pure regex/string extraction, no DOM parsing.
+    ///
+    /// Returns `Some(WalmartOrder)` when alt-text items are found (standard delivery).
+    /// Returns `None` for store deliveries (which use `itemName-*` classes requiring DOM),
+    /// causing the caller to fall back to `parse_order()`.
+    pub fn parse_delivery_fast(
+        &self,
+        html: &str,
+        fallback_date: Option<DateTime<Utc>>,
+    ) -> Option<WalmartOrder> {
+        let _span = tracing::debug_span!("parse_delivery_fast").entered();
+
+        let cutoff = Self::recommendations_cutoff(html);
+        let truncated = &html[..cutoff];
+
+        let order_id = self.extract_order_id(html).ok()?;
+
+        // Extract items via alt-text regex. If none found, this is likely a
+        // store delivery using itemName-* classes — bail out to full DOM path.
+        let items: Vec<LineItem> = self
+            .extract_items_from_alt_regex(truncated)
+            .into_iter()
+            .map(|item| item.with_status(ItemStatus::Delivered))
+            .collect();
+
+        if items.is_empty() {
+            return None;
+        }
+
+        let order_date = self.extract_order_date(html)
+            .unwrap_or_else(|_| fallback_date.unwrap_or_else(Utc::now));
+
+        let total_cost = self.extract_total_price_regex(truncated);
+
+        let mut order = WalmartOrder::new(&order_id, order_date, OrderStatus::Delivered)
+            .with_items(items);
+
+        if let Some(total) = total_cost {
+            order = order.with_total(total);
+        }
+
+        Some(order)
+    }
+
+    /// Fast path for cancellation emails: regex/string extraction, no DOM parsing.
+    ///
+    /// Returns `Some(WalmartOrder)` when the email can be fully parsed without DOM.
+    /// Returns `None` for store pickup cancellations that use `itemName-*` classes
+    /// (which require DOM), causing the caller to fall back to `parse_order()`.
+    pub fn parse_cancellation_fast(
+        &self,
+        html: &str,
+        fallback_date: Option<DateTime<Utc>>,
+    ) -> Option<WalmartOrder> {
+        let _span = tracing::debug_span!("parse_cancellation_fast").entered();
+        let cutoff = Self::recommendations_cutoff(html);
+        let truncated = &html[..cutoff];
+
+        let order_id = self.extract_order_id(html).ok()?;
+        let cancel_reason = self.extract_cancel_reason(html);
+
+        // Try alt-text items for partial cancellations
+        let items: Vec<LineItem> = self.extract_items_from_alt_regex(truncated)
+            .into_iter()
+            .map(|item| item.with_status(ItemStatus::Canceled))
+            .collect();
+
+        // If no alt-text items but HTML contains itemName-* classes,
+        // this is a store pickup cancellation that needs DOM — bail out
+        if items.is_empty() && find_case_insensitive(truncated, "itemname-").is_some() {
+            return None;
+        }
+
+        let order_date = self.extract_order_date(html)
+            .unwrap_or_else(|_| fallback_date.unwrap_or_else(Utc::now));
+
+        let status = if items.is_empty() {
+            OrderStatus::Canceled
+        } else {
+            OrderStatus::PartiallyCanceled
+        };
+
+        let mut order = WalmartOrder::new(&order_id, order_date, status)
+            .with_items(items);
+        if let Some(reason) = cancel_reason {
+            order = order.with_cancel_reason(reason);
+        }
+        Some(order)
+    }
+
     /// Parse a complete order from email HTML.
     /// `fallback_date` is used when HTML date extraction fails (e.g. gmail_date).
     pub fn parse_order(&self, html: &str, fallback_date: Option<DateTime<Utc>>) -> ParseResult<WalmartOrder> {
-        let context = self.build_context(html);
+        // Truncate HTML at the p13n (recommendations) boundary before DOM parsing.
+        // This eliminates 60-80% of the document that we'd otherwise parse into a
+        // full DOM tree only to filter it out during element iteration.
+        let cutoff = Self::recommendations_cutoff(html);
+        let truncated_html = &html[..cutoff];
+
+        let context = self.build_context(truncated_html);
+
+        // Detect email type from the truncated content — type indicators
+        // (shipped, delivered, canceled, confirmed) always appear in the
+        // email header well before any p13n/recommendation content.
         let email_type = self.detect_email_type_lower(&context.lower);
         let order_id = self.extract_order_id(html)?;
 
@@ -1211,6 +1583,25 @@ mod tests {
         assert!(items.iter().all(|item| item.image_url.is_some()), "Each item should have an image");
         assert_eq!(items[0].quantity, 5);
         assert_eq!(items[1].quantity, 2);
+    }
+
+    #[test]
+    fn test_fast_path_regex_extracts_images() {
+        let parser = WalmartEmailParser::new();
+        // The fast-path regex extractor should capture src URLs alongside alt text
+        let items = parser.extract_items_from_alt_regex(sample_shipping_alt_images_html());
+
+        assert_eq!(items.len(), 2, "Fast-path should extract two items");
+        assert_eq!(items[0].quantity, 5);
+        assert_eq!(items[1].quantity, 2);
+        assert!(
+            items.iter().all(|item| item.image_url.is_some()),
+            "Fast-path regex should capture image URLs from src attributes"
+        );
+        assert!(
+            items[0].image_url.as_ref().unwrap().contains("walmartimages.com"),
+            "Image URL should be a Walmart CDN URL"
+        );
     }
 
     #[test]

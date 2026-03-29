@@ -24,6 +24,9 @@ export function switchTab(tabId: TabId): void {
     btn.classList.toggle('active', btn.dataset.tab === tabId);
   });
 
+  // Update settings gear button active state
+  document.getElementById('settings-btn')?.classList.toggle('active', tabId === 'settings');
+
   // Update panels
   document.querySelectorAll<HTMLElement>('.tab-panel').forEach(panel => {
     panel.classList.toggle('active', panel.id === `panel-${tabId}`);
@@ -40,8 +43,14 @@ export function switchTab(tabId: TabId): void {
 function updateIndicator(): void {
   const bar = document.getElementById('tab-bar');
   const indicator = bar?.querySelector<HTMLElement>('.tab-bar-indicator');
-  const activeBtn = bar?.querySelector<HTMLElement>('.tab-item.active');
-  if (!indicator || !activeBtn || !bar) return;
+  if (!indicator || !bar) return;
+
+  const activeBtn = bar.querySelector<HTMLElement>('.tab-item.active');
+  if (!activeBtn) {
+    // No tab-item is active (e.g. settings via gear button) — hide indicator
+    indicator.style.width = '0';
+    return;
+  }
 
   const barRect = bar.getBoundingClientRect();
   const btnRect = activeBtn.getBoundingClientRect();

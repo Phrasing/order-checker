@@ -7,11 +7,18 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        var t = localStorage.getItem('theme');
+        if (!t) t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      })();
+    </script>
 </head>
 <body>
     <div class="app-shell">
         <!-- Tab Bar -->
-        <nav class="tab-bar" id="tab-bar">
+        <nav class="tab-bar" id="tab-bar" data-tauri-drag-region>
             <button class="tab-item active" data-tab="orders">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/>
@@ -30,36 +37,43 @@
                 </svg>
                 Accounts
             </button>
-            <button class="tab-item" data-tab="settings">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
-                </svg>
-                Settings
-            </button>
 
             <div class="tab-bar-actions">
-                <button id="sync-btn" class="sync-btn">
-                    <span class="sync-icon">&#8635;</span> Sync
-                </button>
                 <div class="account-area">
                     <select id="account-select" class="header-account-select" style="display: none;">
                         <option value="">All Accounts</option>
                     </select>
                     <img id="account-avatar" class="account-avatar" src="" alt="" style="display: none;" title="Manage accounts">
                     <div id="account-avatar-fallback" class="account-avatar-fallback" style="display: none;" title="Manage accounts"></div>
+                    <button id="settings-btn" class="settings-btn" title="Settings">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+                        </svg>
+                    </button>
                 </div>
+            </div>
+
+            <div class="window-controls">
+                <button class="window-control-btn" id="btn-minimize" aria-label="Minimize">
+                    <svg width="10" height="1" viewBox="0 0 10 1">
+                        <rect width="10" height="1" fill="currentColor"/>
+                    </svg>
+                </button>
+                <button class="window-control-btn" id="btn-maximize" aria-label="Maximize">
+                    <svg width="10" height="10" viewBox="0 0 10 10">
+                        <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/>
+                    </svg>
+                </button>
+                <button class="window-control-btn window-control-close" id="btn-close" aria-label="Close">
+                    <svg width="10" height="10" viewBox="0 0 10 10">
+                        <line x1="0" y1="0" x2="10" y2="10" stroke="currentColor" stroke-width="1.2"/>
+                        <line x1="10" y1="0" x2="0" y2="10" stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
+                </button>
             </div>
 
             <div class="tab-bar-indicator"></div>
         </nav>
-
-        <!-- Sync Progress (visible on all tabs) -->
-        <div id="sync-progress" class="sync-progress" style="display: none;">
-            <div class="sync-progress-bar">
-                <div class="sync-progress-fill" id="sync-progress-fill"></div>
-            </div>
-            <div class="sync-progress-text" id="sync-progress-text"></div>
-        </div>
 
         <!-- Tab Content -->
         <div class="tab-content">
@@ -104,6 +118,14 @@
                             </div>
                         </div>
 
+                        <!-- Fetch Since -->
+                        <div class="filter-section">
+                            <div class="filter-label">Fetch Since</div>
+                            <input type="date" id="fetch-since-date" class="fetch-since-input"
+                                   title="Sync will fetch emails back to this date">
+                            <div id="fetch-since-hint" class="fetch-since-hint">Default: last 60 days</div>
+                        </div>
+
                         <!-- Date Range Filter -->
                         <div class="filter-section" id="date-range-section">
                             <div class="filter-label">Date Range</div>
@@ -128,10 +150,31 @@
                                 <div class="content-title" id="filter-title">All Orders</div>
                                 <div class="content-subtitle" id="last-updated">Loading...</div>
                             </div>
-                            <div class="search-wrapper">
-                                <span class="search-icon">&#8981;</span>
-                                <input id="search-input" class="search-input" type="text" placeholder="Search orders, products, status...">
+                            <div id="sync-progress" class="sync-progress" style="display: none;">
+                                <div class="sync-progress-bar">
+                                    <div class="sync-progress-fill" id="sync-progress-fill"></div>
+                                </div>
+                                <div class="sync-progress-text" id="sync-progress-text"></div>
                             </div>
+                            <div class="content-header-right">
+                                <button id="sync-btn" class="sync-btn">
+                                    <span class="sync-icon">&#8635;</span> Sync
+                                </button>
+                                <div class="search-wrapper">
+                                    <span class="search-icon">&#8981;</span>
+                                    <input id="search-input" class="search-input" type="text" placeholder="Search orders, products, status...">
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="sort-bar" id="sort-bar">
+                            <div class="sort-col sort-spacer"></div>
+                            <div class="sort-col sortable active" data-sort="date">Date <span class="sort-arrow">&#9660;</span></div>
+                            <div class="sort-col">Product</div>
+                            <div class="sort-col sortable" data-sort="quantity">Qty</div>
+                            <div class="sort-col sortable" data-sort="price">Price</div>
+                            <div class="sort-col sortable" data-sort="status">Status</div>
+                            <div class="sort-col sortable" data-sort="items">Items</div>
                         </div>
 
                         <div class="order-list" id="order-list">

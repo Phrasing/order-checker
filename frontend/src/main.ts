@@ -4,10 +4,22 @@ import './styles/app.css';
 
 import { listen } from '@tauri-apps/api/event';
 import type { NewEmailCheck } from './types';
+
+interface OnnxUnavailablePayload {
+  message: string;
+  download_url: string;
+}
+
+interface ImagesReprocessedPayload {
+  count: number;
+  message: string;
+}
+import * as api from './api';
 import { setNewEmailCount } from './state';
 import {
   setupFilterListeners,
   setupDatePresetListeners,
+  setupFetchSincePicker,
   bindSidebarDeps,
 } from './ui/sidebar';
 import {
@@ -15,6 +27,7 @@ import {
   applyFiltersAndRender,
   applyFiltersAndRenderDebounced,
   toggleOrderDetails,
+  setupSortBar,
 } from './ui/orders';
 import { checkForNewEmails, syncOrders, updateSyncBadge } from './ui/sync';
 import {
@@ -25,10 +38,12 @@ import {
   disconnectAccount,
 } from './ui/accounts';
 import { handleFetchTrackingClick } from './ui/tracking';
-import { setupTabs, getActiveTab } from './ui/tabs';
+import { setupTabs, switchTab } from './ui/tabs';
+import { setupTitlebar } from './ui/titlebar';
 import { setupAnalyticsTab } from './ui/analytics';
 import { setupAccountsTab } from './ui/accounts-tab';
-import { setupSettingsTab, bindSettingsDeps } from './ui/settings-tab';
+import { setupSettingsTab } from './ui/settings-tab';
+import { setupTheme } from './ui/theme';
 
 // Wire up sidebar's lazy dependencies (avoids circular imports at module evaluation time)
 bindSidebarDeps({
@@ -37,9 +52,6 @@ bindSidebarDeps({
   applyFiltersAndRenderDebounced,
   checkForNewEmails,
 });
-
-// Wire up settings tab dependency
-bindSettingsDeps({ checkForNewEmails });
 
 // Event delegation — replaces all inline onclick/onchange/onerror handlers
 
@@ -60,6 +72,11 @@ function setupEventDelegation(): void {
   });
   document.getElementById('account-avatar-fallback')?.addEventListener('click', () => {
     openAccountModal();
+  });
+
+  // Settings gear button → switch to settings tab
+  document.getElementById('settings-btn')?.addEventListener('click', () => {
+    switchTab('settings');
   });
 
   // Modal overlay click-to-close
@@ -125,15 +142,26 @@ function setupEventDelegation(): void {
 // Initialization
 
 document.addEventListener('DOMContentLoaded', () => {
+  setupTheme();
   setupTabs();
+  setupTitlebar();
   setupAnalyticsTab();
   setupAccountsTab();
   setupSettingsTab();
   setupFilterListeners();
   setupDatePresetListeners();
+  setupFetchSincePicker();
   setupEventDelegation();
+  setupSortBar();
   checkForNewEmails();
   loadDashboard();
+
+  // Auto-refresh tracking for shipped orders (fire-and-forget)
+  if (localStorage.getItem('autoRefreshTracking') !== 'false') {
+    api.refreshShippedTracking().catch(e => {
+      console.error('Auto-refresh tracking failed:', e);
+    });
+  }
 
   // Tauri backend events
   listen('tracking-sync-complete', () => {
@@ -147,11 +175,20 @@ document.addEventListener('DOMContentLoaded', () => {
     setNewEmailCount((check.total_new || 0) + (check.total_pending || 0));
     updateSyncBadge();
   });
-});
 
-// Auto-refresh every 60 seconds (only when on Orders tab)
-setInterval(() => {
-  if (getActiveTab() === 'orders') {
-    loadDashboard();
-  }
-}, 60_000);
+  // ONNX/background removal unavailable - logged for debugging
+  // The welcome overlay now handles prompting the user to install VC++ Redistributable
+  listen<OnnxUnavailablePayload>('onnx-unavailable', (event) => {
+    console.warn('ONNX unavailable:', event.payload.message);
+  });
+
+  // Images reprocessed with transparency (after VC++ install)
+  listen<ImagesReprocessedPayload>('images-reprocessed', (event) => {
+    const { count, message } = event.payload;
+    console.log('Images reprocessed:', message);
+    if (count > 0) {
+      // Refresh dashboard to show updated images with transparency
+      loadDashboard();
+    }
+  });
+});

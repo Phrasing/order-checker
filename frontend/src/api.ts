@@ -7,6 +7,7 @@ import type {
   SyncResult,
   TrackingStatusResponse,
   NewEmailCheck,
+  UpcomingDelivery,
 } from './types';
 
 export async function getDashboard(
@@ -85,6 +86,14 @@ export async function getAggregateStats(
   return invoke<AggregateStats>('get_aggregate_stats', args);
 }
 
+export async function getUpcomingDeliveries(
+  accountId?: number | null,
+): Promise<UpcomingDelivery[]> {
+  const args: Record<string, unknown> = {};
+  if (accountId != null) args.accountId = accountId;
+  return invoke<UpcomingDelivery[]>('get_upcoming_deliveries', args);
+}
+
 export async function syncAndProcessOrders(
   fetchSince?: string | null,
 ): Promise<SyncResult> {
@@ -109,6 +118,10 @@ export async function cancelAddAccount(): Promise<void> {
   return invoke<void>('cancel_add_account');
 }
 
+export async function completeAuthWithCode(redirectUrl: string): Promise<string> {
+  return invoke<string>('complete_auth_with_code', { redirectUrl });
+}
+
 export async function removeAccount(accountId: number): Promise<string> {
   return invoke<string>('remove_account', { accountId });
 }
@@ -125,8 +138,33 @@ export async function getTrackingStatus(
   return invoke<TrackingStatusResponse | null>('get_tracking_status', { orderId });
 }
 
+export async function refreshShippedTracking(): Promise<void> {
+  return invoke<void>('refresh_shipped_tracking');
+}
+
 export async function getCachedThumbnails(
   imageIds: string[],
 ): Promise<Record<string, string>> {
   return invoke<Record<string, string>>('get_cached_thumbnails', { imageIds });
+}
+
+export interface ClearDataResult {
+  orders_cleared: number;
+  emails_cleared: number;
+  items_cleared: number;
+  events_cleared: number;
+}
+
+export async function clearAllData(): Promise<ClearDataResult> {
+  return invoke<ClearDataResult>('clear_all_data');
+}
+
+export interface OnnxStatusResult {
+  available: boolean;
+  error: string | null;
+  download_url: string;
+}
+
+export async function checkOnnxStatus(): Promise<OnnxStatusResult> {
+  return invoke<OnnxStatusResult>('check_onnx_status');
 }

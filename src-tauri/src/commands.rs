@@ -14,6 +14,7 @@ use sqlx::Row;
 use sqlx::types::chrono::Utc;
 use walmart_dashboard::auth::{self, AccountAuth, CallbackFlowDelegate, get_gmail_client_for_account, fetch_profile_picture_url};
 use walmart_dashboard::db::Database;
+use walmart_dashboard::images::image_id_for_url;
 use tokio::sync::Semaphore;
 use walmart_dashboard::ingestion;
 use walmart_dashboard::process;
@@ -32,6 +33,8 @@ pub struct AppState {
     /// Directory for storing OAuth token cache files (app data dir).
     /// Kept outside the project tree to avoid triggering the Tauri dev file watcher.
     pub token_dir: PathBuf,
+    /// Directory for storing ONNX model files (background removal).
+    pub models_dir: PathBuf,
     /// Cancellation sender for an in-progress OAuth flow (if any).
     pub auth_cancel: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -187,6 +190,93 @@ pub async fn get_aggregate_stats(
     .map_err(|e| e.to_string())
 }
 
+/// Upcoming delivery item for frontend
+#[derive(Serialize)]
+pub struct UpcomingDelivery {
+    pub order_id: String,
+    pub tracking_number: String,
+    pub carrier: String,
+    pub estimated_delivery: String,
+    pub state: String,
+    pub state_display: String,
+    pub item_name: Option<String>,
+    pub item_count: i32,
+    pub image_id: Option<String>,
+}
+
+/// Get upcoming deliveries with estimated delivery dates
+#[tauri::command]
+pub async fn get_upcoming_deliveries(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+) -> Result<Vec<UpcomingDelivery>, String> {
+    let mut query_str = String::from(
+        r#"
+        SELECT
+            o.id as order_id,
+            tc.tracking_number,
+            tc.carrier,
+            tc.estimated_delivery,
+            tc.state,
+            (SELECT name FROM line_items WHERE order_id = o.id LIMIT 1) as item_name,
+            (SELECT COUNT(*) FROM line_items WHERE order_id = o.id) as item_count,
+            (SELECT image_url FROM line_items WHERE order_id = o.id AND image_url IS NOT NULL LIMIT 1) as image_url
+        FROM orders o
+        JOIN tracking_cache tc ON o.tracking_number = tc.tracking_number
+        WHERE tc.estimated_delivery IS NOT NULL
+          AND tc.state NOT IN ('delivered', 'exception')
+          AND date(substr(tc.estimated_delivery, 1, 10)) >= date('now')
+        "#
+    );
+
+    if account_id.is_some() {
+        query_str.push_str(" AND o.account_id = ?");
+    }
+
+    query_str.push_str(" ORDER BY tc.estimated_delivery ASC");
+
+    let mut query = sqlx::query(&query_str);
+    if let Some(acc_id) = account_id {
+        query = query.bind(acc_id);
+    }
+
+    let rows = query
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let deliveries: Vec<UpcomingDelivery> = rows
+        .iter()
+        .map(|row| {
+            let state: String = row.get("state");
+            let state_display = match state.as_str() {
+                "label_created" => "Label Created",
+                "in_transit" => "In Transit",
+                "out_for_delivery" => "Out for Delivery",
+                "available_for_pickup" => "Available for Pickup",
+                _ => "Unknown",
+            }.to_string();
+
+            let image_url: Option<String> = row.get("image_url");
+            let image_id = image_url.as_ref().map(|url| image_id_for_url(url));
+
+            UpcomingDelivery {
+                order_id: row.get("order_id"),
+                tracking_number: row.get("tracking_number"),
+                carrier: row.get("carrier"),
+                estimated_delivery: row.get("estimated_delivery"),
+                state,
+                state_display,
+                item_name: row.get("item_name"),
+                item_count: row.get::<i32, _>("item_count"),
+                image_id,
+            }
+        })
+        .collect();
+
+    Ok(deliveries)
+}
+
 /// List all configured accounts
 #[tauri::command]
 pub async fn list_accounts(
@@ -215,6 +305,7 @@ pub struct TrackingStatusResponse {
     pub state_description: Option<String>,
     pub is_delivered: bool,
     pub delivery_date: Option<String>,
+    pub estimated_delivery: Option<String>,
     pub last_fetched_at: String,
     pub events: Vec<TrackingEventResponse>,
 }
@@ -251,6 +342,7 @@ pub async fn get_tracking_status(
             state_description: t.state_description.clone(),
             is_delivered: t.is_delivered,
             delivery_date: t.delivery_date.clone(),
+            estimated_delivery: t.estimated_delivery.clone(),
             last_fetched_at: t.last_fetched_at.clone(),
             events: t.events.iter().take(5).map(|e| TrackingEventResponse {
                 time: e.event_time_iso.clone().or_else(|| e.event_time.clone()),
@@ -321,6 +413,7 @@ pub async fn fetch_tracking(
                 state_description: result.state_description,
                 is_delivered: result.is_delivered,
                 delivery_date: result.delivery_date,
+                estimated_delivery: result.estimated_delivery,
                 last_fetched_at: result.last_fetched_at,
                 events: result.events.iter().take(5).map(|e| TrackingEventResponse {
                     time: e.event_time_iso.clone().or_else(|| e.event_time.clone()),
@@ -337,6 +430,47 @@ pub async fn fetch_tracking(
             Ok(None)
         }
     }
+}
+
+/// Refresh tracking data for shipped orders (background, frontend-initiated).
+///
+/// Fetches missing tracking, refreshes all active (non-delivered) entries,
+/// and syncs order statuses from tracking data (shipped → delivered).
+/// Emits `tracking-sync-complete` when finished so the frontend can reload.
+#[tauri::command]
+pub async fn refresh_shipped_tracking(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    let tracking_service = state.tracking_service.clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(async {
+                tracing::info!("Starting auto-refresh of shipped tracking...");
+
+                if let Err(e) = tracking::fetch_missing_tracking_batch(&db, &tracking_service).await {
+                    tracing::error!("Failed to fetch missing tracking: {}", e);
+                }
+                if let Err(e) = tracking::refresh_stale_tracking_batch(&db, &tracking_service, 0).await {
+                    tracing::error!("Failed to refresh stale tracking: {}", e);
+                }
+                if let Err(e) = tracking::sync_delivered_from_tracking(&db).await {
+                    tracing::error!("Failed to sync delivered orders: {}", e);
+                }
+
+                tracing::info!("Auto-refresh of shipped tracking complete");
+                let _ = app.emit("tracking-sync-complete", ());
+                Ok::<(), String>(())
+            }),
+            Err(e) => Err(format!("Failed to create runtime: {}", e)),
+        };
+        let _ = tx.send(result);
+    });
+
+    rx.await.map_err(|_| "Tracking refresh task failed".to_string())?
 }
 
 /// Manually clear the tracking client and global credential cache.
@@ -373,6 +507,15 @@ pub struct ProcessResult {
     pub failed: usize,
     pub skipped: usize,
     pub message: String,
+}
+
+/// Result from clearing all data
+#[derive(Serialize)]
+pub struct ClearDataResult {
+    pub orders_cleared: u64,
+    pub emails_cleared: u64,
+    pub items_cleared: u64,
+    pub events_cleared: u64,
 }
 
 /// Process pending emails into orders
@@ -435,6 +578,7 @@ async fn perform_sync_and_process(
     tracking_service: TrackingService,
     fetch_since: Option<String>,
     token_dir: PathBuf,
+    models_dir: PathBuf,
     app: AppHandle,
 ) -> Result<SyncResult, String> {
     let mut errors = Vec::new();
@@ -524,7 +668,7 @@ async fn perform_sync_and_process(
                             }
                             None => {
                                 ingestion::sync_emails_with_days_and_account(
-                                    &db, gmail_client, 5, acc_id, rate_limit.clone(),
+                                    &db, gmail_client, 60, acc_id, rate_limit.clone(),
                                 ).await
                             }
                         };
@@ -618,10 +762,21 @@ async fn perform_sync_and_process(
 
     let (img_result, tracking_result) = tokio::join!(
         async move {
-            process::process_missing_product_images(&db_img).await
+            process::process_missing_product_images(&db_img, &models_dir).await
         },
         async move {
-            tracking::fetch_missing_tracking_batch(&db_track, &ts).await
+            // Fetch tracking for orders without cache entries
+            let fetch_result = tracking::fetch_missing_tracking_batch(&db_track, &ts).await;
+            // Refresh stale tracking entries (e.g. shipped → delivered transitions)
+            // Uses stale_hours=0 to refresh all non-delivered entries, matching
+            // refresh_shipped_tracking behavior
+            if let Err(ref err) = fetch_result {
+                tracing::error!("Failed to fetch missing tracking: {}", err);
+            }
+            if let Err(err) = tracking::refresh_stale_tracking_batch(&db_track, &ts, 0).await {
+                tracing::error!("Failed to refresh stale tracking: {}", err);
+            }
+            fetch_result
         },
     );
 
@@ -629,8 +784,19 @@ async fn perform_sync_and_process(
     emit_progress(&app, 4, "Syncing statuses", "Updating delivery statuses...");
     let delivered_result = tracking::sync_delivered_from_tracking(&db_delivered).await;
 
-    if let Err(e) = img_result {
-        tracing::warn!("Failed to process product images: {}", e);
+    match img_result {
+        Ok(img_stats) => {
+            if let Some(onnx_error) = img_stats.onnx_error {
+                // Emit event to frontend so user can be prompted to install VC++ Redistributable
+                let _ = app.emit("onnx-unavailable", serde_json::json!({
+                    "message": onnx_error,
+                    "download_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+                }));
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to process product images: {}", e);
+        }
     }
     if let Err(e) = tracking_result {
         let err_msg = format!("Tracking fetch failed: {}", e);
@@ -679,6 +845,7 @@ pub async fn sync_and_process_orders(
     let client_secret_path = state.client_secret_path.clone();
     let tracking_service = state.tracking_service.clone();
     let token_dir = state.token_dir.clone();
+    let models_dir = state.models_dir.clone();
 
     // Run sync in a dedicated thread to avoid HRTB Send issues with the
     // tauri command macro (library futures contain non-Send-for-all-lifetimes types)
@@ -691,6 +858,7 @@ pub async fn sync_and_process_orders(
                 tracking_service,
                 fetch_since,
                 token_dir,
+                models_dir,
                 app,
             )),
             Err(e) => Err(format!("Failed to create sync runtime: {}", e)),
@@ -846,6 +1014,15 @@ pub async fn add_account(
                     ) => {
                         let (email, token_path) = result.map_err(|e| e.to_string())?;
 
+                        // Migrate token from file to secure credential manager
+                        if let Err(err) = auth::migrate_token_to_secure(&email, &token_path) {
+                            tracing::warn!(
+                                email = %email,
+                                error = %err,
+                                "Failed to migrate token to secure storage"
+                            );
+                        }
+
                         // Check if account already exists
                         if let Some(existing) = db.get_account_by_email(&email).await.map_err(|e| e.to_string())? {
                             if existing.is_active {
@@ -912,6 +1089,77 @@ pub async fn cancel_add_account(
     }
 }
 
+/// Complete OAuth authentication using a manually provided redirect URL.
+/// This is used as a fallback when the automatic localhost redirect capture fails.
+#[tauri::command]
+pub async fn complete_auth_with_code(
+    state: State<'_, AppState>,
+    redirect_url: String,
+) -> Result<String, String> {
+    tracing::info!("Completing OAuth with manually provided redirect URL...");
+
+    // Cancel any in-progress automatic OAuth flow
+    {
+        let mut guard = state.auth_cancel.lock().map_err(|e| e.to_string())?;
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    let db = Arc::clone(&state.db);
+    let client_secret_path = state.client_secret_path.clone();
+    let token_dir = state.token_dir.clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(async {
+                // Exchange the code for tokens manually
+                let (email, token_path) = auth::exchange_auth_code_manually(
+                    &client_secret_path,
+                    &redirect_url,
+                    &token_dir,
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+
+                // Check if account already exists
+                if let Some(existing) = db.get_account_by_email(&email).await.map_err(|err| err.to_string())? {
+                    if existing.is_active {
+                        return Ok(email);
+                    }
+                    // Reactivate deactivated account
+                    sqlx::query("UPDATE accounts SET is_active = 1, token_cache_path = ? WHERE email = ?")
+                        .bind(token_path.to_string_lossy().to_string())
+                        .bind(&email)
+                        .execute(db.pool())
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    return Ok(email);
+                }
+
+                // Add new account
+                let token_path_str = token_path.to_string_lossy().to_string();
+                db.add_account(&email, &token_path_str).await.map_err(|err| err.to_string())?;
+
+                // Fetch and store profile picture
+                let account_auth = AccountAuth::with_path(&email, token_path);
+                if let Ok(Some(pic_url)) = fetch_profile_picture_url(&client_secret_path, &account_auth).await {
+                    if let Ok(Some(acc)) = db.get_account_by_email(&email).await {
+                        let _ = db.update_account_profile_picture(acc.id, Some(&pic_url)).await;
+                    }
+                }
+
+                Ok(email)
+            }),
+            Err(err) => Err(format!("Failed to create runtime: {}", err)),
+        };
+        let _ = tx.send(result);
+    });
+
+    rx.await.map_err(|_| "Manual auth task failed".to_string())?
+}
+
 /// Remove a Gmail account and delete all its data (orders, emails, token cache).
 #[tauri::command]
 pub async fn remove_account(
@@ -929,7 +1177,16 @@ pub async fn remove_account(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Delete token cache file (resolve relative paths against token_dir)
+    // Delete token from secure credential manager
+    if let Err(err) = auth::delete_token_secure(&account.email) {
+        tracing::warn!(
+            email = %account.email,
+            error = %err,
+            "Failed to delete token from credential manager"
+        );
+    }
+
+    // Also delete any leftover file (backwards compatibility)
     let token_path = PathBuf::from(&account.token_cache_path);
     let resolved_token_path = if token_path.is_absolute() {
         token_path
@@ -941,4 +1198,112 @@ pub async fn remove_account(
     }
 
     Ok(format!("Removed {} ({} orders, {} emails deleted)", account.email, orders, emails))
+}
+
+/// Clear all orders, emails, line items, and email events from the database.
+/// This is a destructive operation that requires re-syncing to restore data.
+#[tauri::command]
+pub async fn clear_all_data(
+    state: State<'_, AppState>,
+) -> Result<ClearDataResult, String> {
+    let db = &state.db;
+    let pool = db.pool();
+
+    // Clear in order respecting foreign keys:
+    // line_items → orders, email_events → raw_emails
+    let items = sqlx::query("DELETE FROM line_items")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let events = sqlx::query("DELETE FROM email_events")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let orders = sqlx::query("DELETE FROM orders")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let emails = sqlx::query("DELETE FROM raw_emails")
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        orders = orders.rows_affected(),
+        emails = emails.rows_affected(),
+        items = items.rows_affected(),
+        events = events.rows_affected(),
+        "Cleared all data"
+    );
+
+    Ok(ClearDataResult {
+        orders_cleared: orders.rows_affected(),
+        emails_cleared: emails.rows_affected(),
+        items_cleared: items.rows_affected(),
+        events_cleared: events.rows_affected(),
+    })
+}
+
+/// Result of ONNX/background removal status check
+#[derive(Serialize)]
+pub struct OnnxStatusResult {
+    /// Whether ONNX is available and working
+    pub available: bool,
+    /// Error message if not available
+    pub error: Option<String>,
+    /// Download URL for VC++ Redistributable
+    pub download_url: String,
+}
+
+/// Check if ONNX/background removal is available.
+/// This can be called after user installs VC++ Redistributable to verify it's working.
+#[tauri::command]
+pub async fn check_onnx_status(
+    state: State<'_, AppState>,
+) -> Result<OnnxStatusResult, String> {
+    let db = &state.db;
+    let models_dir = &state.models_dir;
+
+    match walmart_dashboard::images::ImageProcessor::new(db.pool().clone(), models_dir).await {
+        Ok((processor, onnx_status)) => {
+            if let Some(walmart_dashboard::images::OnnxStatus::NeedsVcRedist(err)) = onnx_status {
+                Ok(OnnxStatusResult {
+                    available: false,
+                    error: Some(err),
+                    download_url: "https://aka.ms/vs/17/release/vc_redist.x64.exe".to_string(),
+                })
+            } else {
+                // ONNX is working - also trigger reprocessing of non-transparent images
+                let non_transparent_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM images WHERE is_transparent = 0"
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap_or(0);
+
+                if non_transparent_count > 0 {
+                    tracing::info!("ONNX now available, reprocessing {} non-transparent images", non_transparent_count);
+                    tokio::spawn(async move {
+                        if let Err(e) = processor.reprocess_non_transparent_images().await {
+                            tracing::error!("Failed to reprocess images: {}", e);
+                        }
+                    });
+                }
+
+                Ok(OnnxStatusResult {
+                    available: true,
+                    error: None,
+                    download_url: "https://aka.ms/vs/17/release/vc_redist.x64.exe".to_string(),
+                })
+            }
+        }
+        Err(e) => Ok(OnnxStatusResult {
+            available: false,
+            error: Some(e.to_string()),
+            download_url: "https://aka.ms/vs/17/release/vc_redist.x64.exe".to_string(),
+        }),
+    }
 }

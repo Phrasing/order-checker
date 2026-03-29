@@ -545,7 +545,7 @@ pub struct NewEmailCheck {
 ///
 /// Lists Gmail message IDs and deduplicates against the local DB.
 /// When `fetch_since` is provided (e.g. "2025-01-02"), uses the same date range as sync.
-/// Otherwise falls back to the last 5 days.
+/// Otherwise falls back to the last 60 days.
 /// Returns counts of new (unsynced) and pending (unprocessed) emails.
 /// Fails silently per-account — auth/network errors are logged and skipped.
 pub async fn check_new_emails(
@@ -599,13 +599,13 @@ pub async fn check_new_emails(
         let fetcher = GmailFetcher::new(gmail_client);
 
         // List Gmail IDs (cheap — IDs only, no content)
-        // Use fetch_since date if provided, otherwise default to last 5 days
+        // Use fetch_since date if provided, otherwise default to last 60 days
         let list_result = match fetch_since {
             Some(since_date) => {
                 let query = gmail::build_walmart_query_since(since_date);
                 fetcher.list_emails_with_query(&query).await
             }
-            None => fetcher.list_walmart_emails(Some(5)).await,
+            None => fetcher.list_walmart_emails(Some(60)).await,
         };
         let messages = match list_result {
             Ok(msgs) => msgs,

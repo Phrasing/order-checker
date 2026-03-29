@@ -33,7 +33,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use track17_rs::{carriers, format_location as t17_format_location, Track17Client, TrackingResponse, TrackingState as T17State};
+use track17_rs::{carriers, format_location as t17_format_location, ProxyConfig, Track17Client, TrackingResponse, TrackingState as T17State};
 
 /// Tracking state stored in the database
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +125,7 @@ pub struct CachedTracking {
     pub state_description: Option<String>,
     pub is_delivered: bool,
     pub delivery_date: Option<String>,
+    pub estimated_delivery: Option<String>,
     pub last_fetched_at: String,
     pub last_updated_at: String,
     pub fetch_count: i32,
@@ -188,11 +189,21 @@ pub fn format_location(raw_location: Option<String>) -> Option<String> {
     raw_location.map(|loc| t17_format_location(&loc))
 }
 
-/// Tracking service with lazy client initialization
+/// Tracking service with lazy client initialization and proxy rotation
 #[derive(Clone)]
 pub struct TrackingService {
     client: Arc<Mutex<Option<Track17Client>>>,
+    proxy_pool: Vec<ProxyConfig>,
+    /// None = direct connection, Some(idx) = using proxy_pool[idx]
+    current_proxy_idx: Arc<Mutex<Option<usize>>>,
 }
+
+/// Hardcoded proxy pool for rotating on IP-based rate limits (code -5 / uIP)
+const PROXY_POOL: &[&str] = &[
+    "82.27.51.187:61234:user_37aad0cdcbdd:65B3ULdl",
+    "82.27.38.23:61234:user_f266397b11cc:WUaLTpUd",
+    "82.27.38.226:61234:user_496e38d413de:voWg3ien",
+];
 
 impl Default for TrackingService {
     fn default() -> Self {
@@ -201,10 +212,22 @@ impl Default for TrackingService {
 }
 
 impl TrackingService {
-    /// Create a new tracking service
+    /// Create a new tracking service with proxy pool for rate-limit rotation
     pub fn new() -> Self {
+        let proxy_pool: Vec<ProxyConfig> = PROXY_POOL
+            .iter()
+            .filter_map(|spec| ProxyConfig::parse(spec))
+            .collect();
+
+        tracing::debug!(
+            proxy_count = proxy_pool.len(),
+            "TrackingService initialized with proxy pool"
+        );
+
         Self {
             client: Arc::new(Mutex::new(None)),
+            proxy_pool,
+            current_proxy_idx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -264,6 +287,49 @@ impl TrackingService {
     pub async fn get_stats(&self) -> ClientStats {
         let initialized = self.client.lock().await.is_some();
         ClientStats { initialized }
+    }
+
+    /// Check if an error indicates IP-based rate limiting (uIP / code -5)
+    fn is_rate_limit_error(error: &anyhow::Error) -> bool {
+        // Use {:#} to traverse the full anyhow error chain, not just the outermost .context()
+        let msg = format!("{:#}", error).to_lowercase();
+        msg.contains("uip") || msg.contains("ip-based rate limiting")
+    }
+
+    /// Rotate to the next proxy in the pool and rebuild the Track17 client.
+    ///
+    /// Called when the API returns code -5 (uIP), indicating the current IP
+    /// is rate-limited. Creates a new client with the next proxy, sharing
+    /// the global credential cache.
+    async fn rotate_proxy(&self) -> Result<()> {
+        if self.proxy_pool.is_empty() {
+            anyhow::bail!("No proxies configured for rotation");
+        }
+
+        let mut idx_guard = self.current_proxy_idx.lock().await;
+        let next_idx = match *idx_guard {
+            None => 0,
+            Some(idx) => (idx + 1) % self.proxy_pool.len(),
+        };
+        *idx_guard = Some(next_idx);
+        let proxy = self.proxy_pool[next_idx].clone();
+        drop(idx_guard);
+
+        tracing::info!(
+            proxy_host = %proxy.host,
+            proxy_idx = next_idx,
+            pool_size = self.proxy_pool.len(),
+            "Rotating to proxy after rate limit"
+        );
+
+        let new_client = Track17Client::with_proxy(Some(proxy))
+            .await
+            .context("Failed to create Track17Client with proxy")?;
+
+        let mut client_guard = self.client.lock().await;
+        *client_guard = Some(new_client);
+
+        Ok(())
     }
 
     /// Pre-initialize the Track17 client to warm credential cache.
@@ -427,11 +493,52 @@ impl TrackingService {
         result
     }
 
-    /// Batch fetch tracking for multiple numbers (same carrier)
+    /// Batch fetch tracking for multiple numbers (same carrier).
     ///
-    /// With the new architecture, batch operations are efficient (~100-200ms per request)
-    /// after credential cache is warm. Holds client lock for the entire operation.
+    /// On IP-based rate limiting (code -5 / uIP), automatically rotates through
+    /// the proxy pool and retries. Falls through to the caller if all proxies
+    /// are exhausted.
     pub async fn fetch_tracking_batch(
+        &self,
+        tracking_numbers: &[String],
+        carrier_code: u32,
+    ) -> Result<TrackingResponse> {
+        // +1 for the initial attempt (direct or current proxy)
+        let max_attempts = self.proxy_pool.len() + 1;
+
+        for attempt in 0..max_attempts {
+            let result = self
+                .fetch_tracking_batch_inner(tracking_numbers, carrier_code)
+                .await;
+
+            match result {
+                Ok(response) => return Ok(response),
+                Err(ref err) if Self::is_rate_limit_error(err) && attempt < max_attempts - 1 => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts,
+                        "Rate limited (uIP), rotating proxy and retrying batch"
+                    );
+                    if let Err(rotate_err) = self.rotate_proxy().await {
+                        tracing::error!(error = %rotate_err, "Failed to rotate proxy");
+                        return result;
+                    }
+                    // Brief pause before retrying with the new proxy
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        anyhow::bail!(
+            "All {} proxies exhausted after IP-based rate limiting",
+            self.proxy_pool.len()
+        )
+    }
+
+    /// Inner batch fetch — single attempt with current client.
+    async fn fetch_tracking_batch_inner(
         &self,
         tracking_numbers: &[String],
         carrier_code: u32,
@@ -466,28 +573,13 @@ impl TrackingService {
             .context("Failed to batch fetch tracking from 17track.net");
         let elapsed = start.elapsed();
 
-        // Log timing to track credential cache effectiveness
-        let cache_status = if elapsed.as_millis() > 300 {
-            "cold cache (credential extraction)"
-        } else {
-            "warm cache"
-        };
-
         tracing::debug!(
             count = tracking_numbers.len(),
             elapsed_ms = elapsed.as_millis(),
-            "Batch fetch completed in {}ms ({}, avg {}ms per item)",
+            "Batch fetch completed in {}ms (avg {}ms per item)",
             elapsed.as_millis(),
-            cache_status,
             elapsed.as_millis() / tracking_numbers.len().max(1) as u128
         );
-
-        // Log session errors (credentials are managed globally by the library)
-        if let Err(ref e) = result {
-            if Self::is_session_error(e) {
-                tracing::warn!("Credential error in batch fetch (library will handle re-authentication)");
-            }
-        }
 
         result
     }
@@ -609,13 +701,13 @@ impl TrackingService {
     }
 }
 
-/// Get cached tracking from database   
+/// Get cached tracking from database
 pub async fn get_cached_tracking(db: &Database, tracking_number: &str) -> Result<Option<CachedTracking>> {
     let row = sqlx::query(
         r#"
         SELECT id, order_id, tracking_number, carrier, carrier_code, state, state_description,
-               is_delivered, delivery_date, last_fetched_at, last_updated_at, fetch_count,
-               last_error, consecutive_errors
+               is_delivered, delivery_date, estimated_delivery, last_fetched_at, last_updated_at,
+               fetch_count, last_error, consecutive_errors
         FROM tracking_cache
         WHERE tracking_number = ?
         "#,
@@ -641,6 +733,7 @@ pub async fn get_cached_tracking(db: &Database, tracking_number: &str) -> Result
         state_description: row.get("state_description"),
         is_delivered: row.get::<i64, _>("is_delivered") != 0,
         delivery_date: row.get("delivery_date"),
+        estimated_delivery: row.get("estimated_delivery"),
         last_fetched_at: row.get("last_fetched_at"),
         last_updated_at: row.get("last_updated_at"),
         fetch_count: row.get::<i64, _>("fetch_count") as i32,
@@ -685,8 +778,8 @@ async fn get_stale_tracking_entries(db: &Database) -> Result<Vec<CachedTracking>
     let rows = sqlx::query(
         r#"
         SELECT id, order_id, tracking_number, carrier, carrier_code, state, state_description,
-               is_delivered, delivery_date, last_fetched_at, last_updated_at, fetch_count,
-               last_error, consecutive_errors
+               is_delivered, delivery_date, estimated_delivery, last_fetched_at, last_updated_at,
+               fetch_count, last_error, consecutive_errors
         FROM tracking_cache
         WHERE (
             -- Active shipments: refresh every 4 hours
@@ -716,6 +809,7 @@ async fn get_stale_tracking_entries(db: &Database) -> Result<Vec<CachedTracking>
             state_description: row.get("state_description"),
             is_delivered: row.get::<i64, _>("is_delivered") != 0,
             delivery_date: row.get("delivery_date"),
+            estimated_delivery: row.get("estimated_delivery"),
             last_fetched_at: row.get("last_fetched_at"),
             last_updated_at: row.get("last_updated_at"),
             fetch_count: row.get::<i64, _>("fetch_count") as i32,
@@ -741,7 +835,7 @@ async fn update_tracking_cache(
         .find(|s| s.number == tracking_number)
         .or_else(|| response.shipments.first());
 
-    let (state, state_desc, is_delivered, delivery_date, events) = if let Some(shipment) = shipment
+    let (state, state_desc, is_delivered, delivery_date, estimated_delivery, events) = if let Some(shipment) = shipment
     {
         // Get the latest event to determine state
         let latest_event = shipment
@@ -771,6 +865,13 @@ async fn update_tracking_cache(
             None
         };
 
+        // Extract estimated delivery date from time_metrics
+        let estimated_delivery = shipment
+            .shipment
+            .as_ref()
+            .and_then(|s| s.estimated_delivery())
+            .map(|s| s.to_string());
+
         // Collect all events
         let events: Vec<_> = shipment
             .shipment
@@ -794,9 +895,9 @@ async fn update_tracking_cache(
             })
             .unwrap_or_default();
 
-        (tracking_state, state_desc, is_delivered, delivery_date, events)
+        (tracking_state, state_desc, is_delivered, delivery_date, estimated_delivery, events)
     } else {
-        (TrackingState::Unknown, None, false, None, vec![])
+        (TrackingState::Unknown, None, false, None, None, vec![])
     };
 
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -805,14 +906,15 @@ async fn update_tracking_cache(
     sqlx::query(
         r#"
         INSERT INTO tracking_cache (tracking_number, carrier, carrier_code, state, state_description,
-                                    is_delivered, delivery_date, last_fetched_at, last_updated_at,
-                                    fetch_count, last_error, consecutive_errors)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0)
+                                    is_delivered, delivery_date, estimated_delivery, last_fetched_at,
+                                    last_updated_at, fetch_count, last_error, consecutive_errors)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0)
         ON CONFLICT(tracking_number) DO UPDATE SET
             state = excluded.state,
             state_description = excluded.state_description,
             is_delivered = excluded.is_delivered,
             delivery_date = COALESCE(excluded.delivery_date, tracking_cache.delivery_date),
+            estimated_delivery = COALESCE(excluded.estimated_delivery, tracking_cache.estimated_delivery),
             last_fetched_at = excluded.last_fetched_at,
             last_updated_at = excluded.last_updated_at,
             fetch_count = tracking_cache.fetch_count + 1,
@@ -827,6 +929,7 @@ async fn update_tracking_cache(
     .bind(&state_desc)
     .bind(is_delivered as i64)
     .bind(&delivery_date)
+    .bind(&estimated_delivery)
     .bind(&now)
     .bind(&now)
     .execute(db.pool())
@@ -955,8 +1058,9 @@ pub async fn get_tracking_for_order(db: &Database, order_id: &str) -> Result<Vec
     let rows = sqlx::query(
         r#"
         SELECT tc.id, tc.order_id, tc.tracking_number, tc.carrier, tc.carrier_code, tc.state,
-               tc.state_description, tc.is_delivered, tc.delivery_date, tc.last_fetched_at,
-               tc.last_updated_at, tc.fetch_count, tc.last_error, tc.consecutive_errors
+               tc.state_description, tc.is_delivered, tc.delivery_date, tc.estimated_delivery,
+               tc.last_fetched_at, tc.last_updated_at, tc.fetch_count, tc.last_error,
+               tc.consecutive_errors
         FROM tracking_cache tc
         LEFT JOIN orders o ON o.tracking_number = tc.tracking_number
         WHERE tc.order_id = ? OR o.id = ?
@@ -984,6 +1088,7 @@ pub async fn get_tracking_for_order(db: &Database, order_id: &str) -> Result<Vec
             state_description: row.get("state_description"),
             is_delivered: row.get::<i64, _>("is_delivered") != 0,
             delivery_date: row.get("delivery_date"),
+            estimated_delivery: row.get("estimated_delivery"),
             last_fetched_at: row.get("last_fetched_at"),
             last_updated_at: row.get("last_updated_at"),
             fetch_count: row.get::<i64, _>("fetch_count") as i32,
@@ -999,7 +1104,8 @@ pub async fn get_tracking_for_order(db: &Database, order_id: &str) -> Result<Vec
 /// Check if an error is a credential/session failure from track17-rs.
 /// When credentials are persistently rejected, there's no point retrying more batches.
 fn is_credential_error(e: &anyhow::Error) -> bool {
-    let msg = e.to_string().to_lowercase();
+    // Use {:#} to traverse the full anyhow error chain, not just the outermost .context()
+    let msg = format!("{:#}", e).to_lowercase();
     msg.contains("credential refresh failed")
         || msg.contains("failed to initialize track17")
         || msg.contains("failed to launch browser")
@@ -1103,6 +1209,12 @@ pub async fn fetch_missing_tracking_batch(
                         );
                         return Ok(fetched);
                     }
+                    if TrackingService::is_rate_limit_error(&e) {
+                        tracing::error!(
+                            "All proxies exhausted after rate limiting — aborting remaining tracking fetches"
+                        );
+                        return Ok(fetched);
+                    }
                 }
             }
         }
@@ -1132,7 +1244,6 @@ pub async fn refresh_stale_tracking_batch(
         WHERE tc.last_fetched_at < ?
           AND tc.state != 'delivered'
         ORDER BY tc.carrier, tc.last_fetched_at ASC
-        LIMIT 120
         "#,
     )
     .bind(&cutoff_str)
@@ -1159,6 +1270,11 @@ pub async fn refresh_stale_tracking_batch(
         let carrier_code = carrier_to_code(&carrier);
 
         for chunk in tracking_numbers.chunks(40) {
+            // Throttle between batches to reduce IP rate limiting pressure
+            if refreshed > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
             let nums: Vec<String> = chunk.to_vec();
 
             match service.fetch_tracking_batch(&nums, carrier_code).await {
@@ -1187,6 +1303,12 @@ pub async fn refresh_stale_tracking_batch(
                     if is_credential_error(&e) {
                         tracing::error!(
                             "Credential/session failure detected — aborting remaining tracking refreshes"
+                        );
+                        return Ok(refreshed);
+                    }
+                    if TrackingService::is_rate_limit_error(&e) {
+                        tracing::error!(
+                            "All proxies exhausted after rate limiting — aborting remaining tracking refreshes"
                         );
                         return Ok(refreshed);
                     }

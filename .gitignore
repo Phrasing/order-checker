@@ -35,10 +35,20 @@ NUL
 
 # Debug output
 debug_output.txt
+debug-user-log.txt
 price_debug*.txt
+out*.txt
+phase2_results.txt
 
 # Test artifacts
 rembg-test-*
+test_output/
+test_query.rs
+*.eml
+
+# Debug screenshots and logs
+*.log
+*.log.*
 
 # Logs (can grow very large)
 logs/
@@ -49,3 +59,9 @@ logs/
 
 # Emails (sensitive data)
 emails/
+
+# Misc
+_NUL
+src/bin/test_parse_email.rs
+src/reset_deliveries.rs
+src-cli/parse_email_file.rs

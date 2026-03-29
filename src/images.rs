@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -38,28 +39,98 @@ impl BackgroundRemover for NoopRemover {
     }
 }
 
-/// Background remover powered by the rmbg crate (enabled with the `rmbg` feature).
-#[cfg(feature = "rmbg")]
-pub struct RmbgRemover {
-    session: rmbg::Rmbg,
+/// Background remover powered by the rembg-rs crate (native ONNX inference).
+pub struct RembgRemover {
+    manager: std::sync::Mutex<rembg_rs::manager::ModelManager>,
 }
 
-#[cfg(feature = "rmbg")]
-impl RmbgRemover {
-    pub fn new(model_bytes: &[u8]) -> Result<Self> {
-        let session = rmbg::Rmbg::new(model_bytes)
-            .context("Failed to initialize rmbg session")?;
-        Ok(Self { session })
+/// Result of ONNX runtime verification.
+#[derive(Debug, Clone)]
+pub enum OnnxStatus {
+    /// ONNX runtime is working correctly
+    Working,
+    /// ONNX runtime failed - user should install VC++ Redistributable
+    NeedsVcRedist(String),
+}
+
+impl RembgRemover {
+    pub fn new(model_path: &Path) -> Result<Self> {
+        let path = model_path.to_path_buf();
+
+        // Catch panics during ONNX model loading (can crash on systems without VC++ Redistributable)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rembg_rs::manager::ModelManager::from_file(&path)
+        }));
+
+        match result {
+            Ok(Ok(manager)) => Ok(Self {
+                manager: std::sync::Mutex::new(manager),
+            }),
+            Ok(Err(err)) => Err(anyhow::anyhow!(
+                "ONNX model load error: {}. Install Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                err
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "ONNX runtime crashed during initialization. Install Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            )),
+        }
+    }
+
+    /// Verify ONNX inference works by running a small test.
+    /// Returns OnnxStatus indicating whether VC++ Redistributable is needed.
+    pub fn verify_working(&self) -> OnnxStatus {
+        // Create a tiny 8x8 test image (minimum size for rembg)
+        let test_img = DynamicImage::new_rgb8(8, 8);
+
+        match self.remove_background(test_img) {
+            Ok(_) => OnnxStatus::Working,
+            Err(err) => OnnxStatus::NeedsVcRedist(err.to_string()),
+        }
     }
 }
 
-#[cfg(feature = "rmbg")]
-impl BackgroundRemover for RmbgRemover {
+impl BackgroundRemover for RembgRemover {
     fn remove_background(&self, image: DynamicImage) -> Result<DynamicImage> {
-        self.session
-            .remove_background(&image)
-            .context("rmbg failed to remove background")
+        let mut mgr = self
+            .manager
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Model manager lock poisoned: {}", e))?;
+
+        let options = rembg_rs::options::RemovalOptions::default();
+
+        // Catch panics during ONNX inference (can crash on systems without VC++ Redistributable)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rembg_rs::rembg::rembg(&mut mgr, image.clone(), &options)
+        }));
+
+        match result {
+            Ok(Ok(rembg_result)) => {
+                let (rgba, _mask) = rembg_result.into_parts();
+                Ok(DynamicImage::ImageRgba8(rgba))
+            }
+            Ok(Err(err)) => Err(anyhow::anyhow!("rembg failed: {}", err)),
+            Err(_) => Err(anyhow::anyhow!(
+                "ONNX inference crashed. Install Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+            )),
+        }
     }
+}
+
+const MODEL_FILENAME: &str = "silueta.onnx";
+const MODEL_URL: &str =
+    "https://github.com/danielgatis/rembg/releases/download/v0.0.0/silueta.onnx";
+const THUMBNAIL_SIZE: u32 = 112;
+
+const ORT_VERSION: &str = "1.22.0";
+const ORT_DLL_FILENAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "windows")]
+const ORT_DOWNLOAD_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip";
+
+struct Thumbnail {
+    bytes: Vec<u8>,
+    content_type: String,
+    width: u32,
+    height: u32,
 }
 
 /// Processor for downloading and caching product images.
@@ -69,24 +140,76 @@ pub struct ImageProcessor {
     client: Client,
     semaphore: Arc<Semaphore>,
     remover: Arc<dyn BackgroundRemover>,
-    rembg_endpoint: Option<String>,
-}
-
-const DEFAULT_REMBG_ENDPOINT: &str = "http://127.0.0.1:5000";
-const REMBG_REMOVE_PATH: &str = "/api/remove";
-const THUMBNAIL_SIZE: u32 = 112;
-
-struct Thumbnail {
-    bytes: Vec<u8>,
-    content_type: String,
-    width: u32,
-    height: u32,
+    /// True if using a real background remover (not NoopRemover)
+    has_real_remover: bool,
 }
 
 impl ImageProcessor {
-    /// Create a new processor with a custom background remover.
-    pub async fn new(pool: SqlitePool, remover: Arc<dyn BackgroundRemover>) -> Result<Self> {
+    /// Create a processor with local background removal via rembg-rs.
+    /// Downloads the ONNX model on first use if not present in `models_dir`.
+    /// Returns (ImageProcessor, Option<OnnxStatus>) - the status indicates if VC++ is needed.
+    pub async fn new(pool: SqlitePool, models_dir: &Path) -> Result<(Self, Option<OnnxStatus>)> {
         // Enable WAL for better concurrency during large syncs.
+        sqlx::query("PRAGMA journal_mode=WAL;")
+            .execute(&pool)
+            .await?;
+
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+
+        // Ensure ONNX Runtime DLL is available (downloads ~70 MB on first run)
+        ensure_ort_runtime_impl(models_dir, &client).await?;
+
+        // Download ONNX model if missing (~43 MB on first run)
+        let model_path = ensure_model(models_dir, &client).await?;
+
+        // Create local background remover with pre-flight verification
+        let (remover, has_real_remover, onnx_status): (Arc<dyn BackgroundRemover>, bool, Option<OnnxStatus>) =
+            match RembgRemover::new(&model_path) {
+                Ok(rembg) => {
+                    // Verify ONNX actually works with a test inference
+                    let status = rembg.verify_working();
+                    match &status {
+                        OnnxStatus::Working => {
+                            tracing::info!("ONNX background remover initialized and verified");
+                            (Arc::new(rembg), true, None)
+                        }
+                        OnnxStatus::NeedsVcRedist(err) => {
+                            tracing::warn!(
+                                "ONNX verification failed: {}. Using NoopRemover.",
+                                err
+                            );
+                            (Arc::new(NoopRemover), false, Some(status))
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to init background remover: {}. Using NoopRemover.",
+                        err
+                    );
+                    let status = OnnxStatus::NeedsVcRedist(err.to_string());
+                    (Arc::new(NoopRemover), false, Some(status))
+                }
+            };
+
+        let max_concurrency = std::cmp::max(1, num_cpus::get() / 2);
+        let max_concurrency = std::cmp::min(8, max_concurrency);
+        Ok((
+            Self {
+                pool,
+                client,
+                semaphore: Arc::new(Semaphore::new(max_concurrency)),
+                remover,
+                has_real_remover,
+            },
+            onnx_status,
+        ))
+    }
+
+    /// Create a processor without background removal (thumbnails / download only).
+    pub async fn new_noop(pool: SqlitePool) -> Result<Self> {
         sqlx::query("PRAGMA journal_mode=WAL;")
             .execute(&pool)
             .await?;
@@ -99,30 +222,9 @@ impl ImageProcessor {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             semaphore: Arc::new(Semaphore::new(max_concurrency)),
-            remover,
-            rembg_endpoint: None,
+            remover: Arc::new(NoopRemover),
+            has_real_remover: false,
         })
-    }
-
-    /// Upgrade semaphore concurrency for HTTP rembg mode (network-bound, not CPU-bound).
-    fn upgrade_concurrency_for_http(&mut self) {
-        self.semaphore = Arc::new(Semaphore::new(16));
-    }
-
-    /// Create a processor that uses the rembg HTTP server for background removal.
-    pub async fn new_rembg_http(
-        pool: SqlitePool,
-        endpoint: impl Into<String>,
-    ) -> Result<Self> {
-        let mut processor = Self::new(pool, Arc::new(NoopRemover)).await?;
-        processor.rembg_endpoint = Some(normalize_rembg_endpoint(endpoint.into()));
-        processor.upgrade_concurrency_for_http();
-        Ok(processor)
-    }
-
-    /// Create a processor that uses the default rembg HTTP endpoint.
-    pub async fn new_rembg_http_default(pool: SqlitePool) -> Result<Self> {
-        Self::new_rembg_http(pool, DEFAULT_REMBG_ENDPOINT).await
     }
 
     /// Process a batch of URLs with bounded concurrency.
@@ -140,7 +242,7 @@ impl ImageProcessor {
             }
 
             let processor = self.clone();
-            let permit = self.semaphore.clone().acquire_owned().await?; 
+            let permit = self.semaphore.clone().acquire_owned().await?;
             tasks.push(tokio::spawn(async move {
                 let _permit = permit;
                 processor.process_one(&url).await
@@ -163,7 +265,7 @@ impl ImageProcessor {
             return Ok(cached);
         }
 
-        // Download at reduced resolution when possible (saves bandwidth + faster rembg)
+        // Download at reduced resolution when possible (saves bandwidth + faster processing)
         let download_url = optimize_image_download_url(url);
         let response = self
             .client
@@ -181,48 +283,39 @@ impl ImageProcessor {
 
         let original_bytes = response.bytes().await?.to_vec();
 
-        let processed = if let Some(endpoint) = &self.rembg_endpoint {
-            match self.remove_background_http(endpoint, &original_bytes).await {
-                Ok(png_bytes) => ProcessedImage {
-                    url: url.to_string(),
-                    id: id.clone(),
-                    bytes: png_bytes,
-                    content_type: Some("image/png".to_string()),
-                    is_transparent: true,
-                    from_cache: false,
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        url = url,
-                        error = %err,
-                        "rembg HTTP failed; falling back to original image"
-                    );
-                    fallback_result(url, &id, &original_bytes, content_type.clone())
-                }
-            }
-        } else {
-            match decode_image(&original_bytes) {
-                Ok(image) => match self.remover.remove_background(image) {
-                    Ok(removed) => match encode_png(&removed) {
-                        Ok(png_bytes) => ProcessedImage {
-                            url: url.to_string(),
-                            id: id.clone(),
-                            bytes: png_bytes,
-                            content_type: Some("image/png".to_string()),
-                            is_transparent: true,
-                            from_cache: false,
-                        },
-                        Err(_) => fallback_result(url, &id, &original_bytes, content_type.clone()),
-                    },
-                    Err(_) => fallback_result(url, &id, &original_bytes, content_type.clone()),
-                },
-                Err(_) => fallback_result(url, &id, &original_bytes, content_type.clone()),
+        // Run background removal on a blocking thread (CPU-bound ONNX inference)
+        let remover = Arc::clone(&self.remover);
+        let bytes_for_removal = original_bytes.clone();
+        let has_real_remover = self.has_real_remover;
+        let processed = match tokio::task::spawn_blocking(move || {
+            let image = decode_image(&bytes_for_removal)?;
+            let removed = remover.remove_background(image)?;
+            encode_png(&removed)
+        })
+        .await?
+        {
+            Ok(png_bytes) => ProcessedImage {
+                url: url.to_string(),
+                id: id.clone(),
+                bytes: png_bytes,
+                content_type: Some("image/png".to_string()),
+                // Only mark as transparent if we used a real background remover
+                is_transparent: has_real_remover,
+                from_cache: false,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    url = url,
+                    error = %err,
+                    "Background removal failed; falling back to original image"
+                );
+                fallback_result(url, &id, &original_bytes, content_type.clone())
             }
         };
 
         self.store_cached(&processed).await?;
 
-        if let Some(thumbnail) = generate_thumbnail(&processed.bytes)
+        if let Ok(thumbnail) = generate_thumbnail(&processed.bytes)
             .or_else(|_| generate_thumbnail(&original_bytes))
             .map_err(|e| {
                 tracing::warn!(
@@ -232,7 +325,6 @@ impl ImageProcessor {
                 );
                 e
             })
-            .ok()
         {
             if let Err(e) = self.store_thumbnail(&processed.id, &thumbnail).await {
                 tracing::warn!(
@@ -244,35 +336,6 @@ impl ImageProcessor {
         }
 
         Ok(processed)
-    }
-
-    async fn remove_background_http(&self, endpoint: &str, bytes: &[u8]) -> Result<Vec<u8>> {
-        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-            .file_name("image")
-            .mime_str("application/octet-stream")?;
-        let form = reqwest::multipart::Form::new().part("file", part);
-
-        let response = self
-            .client
-            .post(endpoint)
-            .multipart(form)
-            .send()
-            .await
-            .context("Failed to call rembg server")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "rembg server returned status {}",
-                response.status()
-            ));
-        }
-
-        let png_bytes = response.bytes().await?.to_vec();
-        if png_bytes.is_empty() {
-            return Err(anyhow::anyhow!("rembg server returned empty body"));
-        }
-
-        Ok(png_bytes)
     }
 
     async fn fetch_cached(&self, id: &str) -> Result<Option<ProcessedImage>> {
@@ -409,28 +472,223 @@ impl ImageProcessor {
             }
         }
     }
+
+    /// Count images that don't have transparent backgrounds.
+    pub async fn count_non_transparent_images(&self) -> Result<usize> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM images WHERE is_transparent = 0"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0 as usize)
+    }
+
+    /// Reprocess all non-transparent images with background removal.
+    /// Returns the number of images successfully reprocessed.
+    pub async fn reprocess_non_transparent_images(&self) -> Result<usize> {
+        let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, url, image_bytes FROM images WHERE is_transparent = 0"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        tracing::info!("Reprocessing {} non-transparent images with background removal", rows.len());
+
+        let mut reprocessed = 0usize;
+        let mut tasks = FuturesUnordered::new();
+
+        for (image_id, url, original_bytes) in rows {
+            let processor = self.clone();
+            let permit = self.semaphore.clone().acquire_owned().await?;
+            tasks.push(tokio::spawn(async move {
+                let _permit = permit;
+                processor.reprocess_single_image(&image_id, &url, &original_bytes).await
+            }));
+        }
+
+        while let Some(joined) = tasks.next().await {
+            match joined {
+                Ok(Ok(true)) => reprocessed += 1,
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to reprocess image: {}", e);
+                }
+                Err(e) => {
+                    tracing::warn!("Reprocess task panicked: {}", e);
+                }
+            }
+        }
+
+        tracing::info!("Reprocessed {} images with transparent backgrounds", reprocessed);
+        Ok(reprocessed)
+    }
+
+    async fn reprocess_single_image(&self, image_id: &str, url: &str, original_bytes: &[u8]) -> Result<bool> {
+        // Run background removal on the original image
+        let remover = Arc::clone(&self.remover);
+        let bytes_for_removal = original_bytes.to_vec();
+
+        let processed = match tokio::task::spawn_blocking(move || {
+            let image = decode_image(&bytes_for_removal)?;
+            let removed = remover.remove_background(image)?;
+            encode_png(&removed)
+        })
+        .await?
+        {
+            Ok(png_bytes) => {
+                // Update the image in the database
+                sqlx::query(
+                    "UPDATE images SET image_bytes = ?, content_type = 'image/png', is_transparent = 1 WHERE id = ?"
+                )
+                .bind(&png_bytes)
+                .bind(image_id)
+                .execute(&self.pool)
+                .await?;
+
+                // Regenerate thumbnail with new transparent image
+                if let Ok(thumbnail) = generate_thumbnail(&png_bytes) {
+                    let _ = self.store_thumbnail(image_id, &thumbnail).await;
+                }
+
+                tracing::debug!("Reprocessed image {} with transparency", image_id);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    url = url,
+                    error = %err,
+                    "Background removal failed during reprocessing"
+                );
+                false
+            }
+        };
+
+        Ok(processed)
+    }
+
+    /// Check if this processor has a working background remover (not NoopRemover).
+    pub fn has_working_remover(&self) -> bool {
+        self.has_real_remover
+    }
 }
 
-fn normalize_rembg_endpoint(endpoint: String) -> String {
-    let mut endpoint = if endpoint.trim().is_empty() {
-        DEFAULT_REMBG_ENDPOINT.to_string()
-    } else {
-        endpoint
-    };
-
-    if endpoint.ends_with(REMBG_REMOVE_PATH) {
-        return endpoint;
+async fn ensure_model(models_dir: &Path, client: &Client) -> Result<std::path::PathBuf> {
+    let model_path = models_dir.join(MODEL_FILENAME);
+    if model_path.exists() {
+        return Ok(model_path);
     }
 
-    if endpoint.ends_with('/') {
-        endpoint.pop();
+    std::fs::create_dir_all(models_dir)
+        .with_context(|| format!("Failed to create models dir: {}", models_dir.display()))?;
+
+    tracing::info!(
+        "Downloading background removal model ({})...",
+        MODEL_FILENAME
+    );
+
+    let response = client
+        .get(MODEL_URL)
+        .send()
+        .await
+        .context("Failed to download ONNX model")?
+        .error_for_status()
+        .context("ONNX model download returned error status")?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .context("Failed to read ONNX model response body")?;
+
+    std::fs::write(&model_path, &bytes)
+        .with_context(|| format!("Failed to write model to {}", model_path.display()))?;
+
+    tracing::info!(
+        "Model downloaded ({:.1} MB) to {}",
+        bytes.len() as f64 / 1_048_576.0,
+        model_path.display()
+    );
+
+    Ok(model_path)
+}
+
+/// Download and set up the ONNX Runtime DLL so `ort` finds the correct version.
+#[cfg(target_os = "windows")]
+async fn ensure_ort_runtime_impl(models_dir: &Path, client: &Client) -> Result<std::path::PathBuf> {
+    let dll_path = models_dir.join(ORT_DLL_FILENAME);
+    if dll_path.exists() {
+        std::env::set_var("ORT_DYLIB_PATH", &dll_path);
+        return Ok(dll_path);
     }
 
-    if endpoint.ends_with(REMBG_REMOVE_PATH) {
-        endpoint
-    } else {
-        format!("{endpoint}{REMBG_REMOVE_PATH}")
-    }
+    std::fs::create_dir_all(models_dir)
+        .with_context(|| format!("Failed to create models dir: {}", models_dir.display()))?;
+
+    tracing::info!("Downloading ONNX Runtime v{}...", ORT_VERSION);
+
+    let zip_path = models_dir.join(format!("onnxruntime-win-x64-{}.zip", ORT_VERSION));
+    let response = client
+        .get(ORT_DOWNLOAD_URL)
+        .send()
+        .await
+        .context("Failed to download ONNX Runtime")?
+        .error_for_status()
+        .context("ONNX Runtime download returned error status")?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .context("Failed to read ONNX Runtime response body")?;
+
+    std::fs::write(&zip_path, &bytes)
+        .with_context(|| format!("Failed to write zip to {}", zip_path.display()))?;
+
+    tracing::info!(
+        "Downloaded ONNX Runtime ({:.1} MB), extracting...",
+        bytes.len() as f64 / 1_048_576.0
+    );
+
+    // Extract the DLL directly from the zip archive using the zip crate
+    let dll_bytes = {
+        let zip_file = std::fs::File::open(&zip_path)
+            .with_context(|| format!("Failed to open zip file: {}", zip_path.display()))?;
+        let mut archive = zip::ZipArchive::new(zip_file)
+            .context("Failed to read ONNX Runtime zip archive")?;
+
+        // Find and extract the DLL from the archive
+        let dll_entry_path = format!("onnxruntime-win-x64-{}/lib/{}", ORT_VERSION, ORT_DLL_FILENAME);
+        let mut dll_entry = archive
+            .by_name(&dll_entry_path)
+            .with_context(|| format!("DLL not found in archive at path: {}", dll_entry_path))?;
+
+        let mut bytes = Vec::with_capacity(dll_entry.size() as usize);
+        std::io::Read::read_to_end(&mut dll_entry, &mut bytes)
+            .context("Failed to read DLL from zip archive")?;
+        bytes
+        };
+
+    std::fs::write(&dll_path, &dll_bytes)
+        .with_context(|| format!("Failed to write DLL to {}", dll_path.display()))?;
+
+    // Clean up zip file
+    std::fs::remove_file(&zip_path).ok();
+
+    std::env::set_var("ORT_DYLIB_PATH", &dll_path);
+    tracing::info!(
+        "ONNX Runtime v{} installed to {}",
+        ORT_VERSION,
+        dll_path.display()
+    );
+
+    Ok(dll_path)
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn ensure_ort_runtime_impl(_models_dir: &Path, _client: &Client) -> Result<std::path::PathBuf> {
+    anyhow::bail!("Automatic ONNX Runtime download is only supported on Windows. Set ORT_DYLIB_PATH manually.")
 }
 
 fn hash_url(url: &str) -> String {
@@ -522,7 +780,7 @@ mod tests {
         let db = Database::in_memory().await.expect("db init");
         db.run_migrations().await.expect("migrations");
 
-        let processor = ImageProcessor::new(db.pool().clone(), Arc::new(NoopRemover))
+        let processor = ImageProcessor::new_noop(db.pool().clone())
             .await
             .expect("processor");
 
@@ -564,19 +822,5 @@ mod tests {
         assert!(!thumb_bytes.is_empty(), "thumbnail bytes should be non-empty");
         assert!(width > 0 && width <= THUMBNAIL_SIZE as i64);
         assert!(height > 0 && height <= THUMBNAIL_SIZE as i64);
-    }
-
-    #[test]
-    fn default_rembg_endpoint_is_localhost() {
-        assert_eq!(DEFAULT_REMBG_ENDPOINT, "http://127.0.0.1:5000");
-    }
-
-    #[test]
-    fn rembg_endpoint_normalization_appends_path() {
-        let base = "http://127.0.0.1:5000".to_string();
-        assert_eq!(
-            normalize_rembg_endpoint(base),
-            "http://127.0.0.1:5000/api/remove"
-        );
     }
 }

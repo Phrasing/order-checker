@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use url::Url;
 
 /// Default path for token cache file
 pub const DEFAULT_TOKEN_CACHE_PATH: &str = "token_cache.json";
@@ -201,11 +202,26 @@ impl AccountAuth {
 
 /// Authenticate a specific Gmail account and return a client.
 /// This triggers the OAuth flow if no valid token is cached.
+///
+/// Uses secure credential storage (Windows Credential Manager) with a hybrid approach:
+/// 1. Restore token from credential manager to temp file for yup-oauth2 compatibility
+/// 2. Let yup-oauth2 handle token refresh if needed
+/// 3. Migrate updated token back to credential manager
 pub async fn get_gmail_client_for_account(
     client_secret_path: &Path,
     account_auth: &AccountAuth,
 ) -> Result<GmailClient> {
     tracing::info!(email = %account_auth.email, "Initializing Gmail authentication for account...");
+
+    // Step 1: Try to restore token from credential manager to file for yup-oauth2
+    let restored_from_secure = restore_token_to_file(
+        &account_auth.email,
+        &account_auth.token_cache_path,
+    ).unwrap_or(false);
+
+    if restored_from_secure {
+        tracing::debug!(email = %account_auth.email, "Restored token from secure storage");
+    }
 
     // Read the client secret file
     let secret = oauth2::read_application_secret(client_secret_path)
@@ -225,12 +241,21 @@ pub async fn get_gmail_client_for_account(
     .await
     .context("Failed to build authenticator")?;
 
-    // Pre-authorize to ensure we have valid tokens
+    // Pre-authorize to ensure we have valid tokens (may trigger refresh)
     auth.token(GMAIL_SCOPES)
         .await
         .context("Failed to get access token. You may need to re-authenticate.")?;
 
     tracing::info!(email = %account_auth.email, "Gmail authentication successful");
+
+    // Step 2: Migrate token back to secure storage (may have been refreshed)
+    if let Err(err) = migrate_token_to_secure(&account_auth.email, &account_auth.token_cache_path) {
+        tracing::warn!(
+            email = %account_auth.email,
+            error = %err,
+            "Failed to migrate token to secure storage"
+        );
+    }
 
     // Build the HTTP client
     let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
@@ -345,6 +370,160 @@ struct UserInfoResponse {
     picture: Option<String>,
 }
 
+/// Response from Google's token exchange endpoint
+#[derive(Debug, serde::Deserialize)]
+struct TokenExchangeResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: u64,
+    #[allow(dead_code)]
+    token_type: String,
+    #[allow(dead_code)]
+    scope: Option<String>,
+    id_token: Option<String>,
+}
+
+/// Response from Gmail profile endpoint
+#[derive(Debug, serde::Deserialize)]
+struct GmailProfileResponse {
+    #[serde(rename = "emailAddress")]
+    email_address: String,
+}
+
+/// Token storage format compatible with yup-oauth2's disk persistence.
+/// This must match the format that `InstalledFlowAuthenticator::persist_tokens_to_disk` uses.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct StoredTokenEntry {
+    pub scopes: Vec<String>,
+    pub token: StoredToken,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct StoredToken {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    /// RFC3339 formatted expiry time
+    pub expires_at: Option<String>,
+    pub id_token: Option<String>,
+}
+
+// ==================== Secure Credential Storage ====================
+
+/// Service name for Windows Credential Manager entries.
+const CREDENTIAL_SERVICE: &str = "com.order-checker.app";
+
+/// Store OAuth token securely in Windows Credential Manager.
+/// The token data is JSON-encoded and stored encrypted via DPAPI.
+pub fn store_token_secure(email: &str, token_entries: &[StoredTokenEntry]) -> Result<()> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .context("Failed to create keyring entry")?;
+
+    let token_json = serde_json::to_string(token_entries)
+        .context("Failed to serialize token")?;
+
+    entry.set_password(&token_json)
+        .context("Failed to store token in credential manager")?;
+
+    tracing::info!(email = %email, "Token stored securely in credential manager");
+    Ok(())
+}
+
+/// Retrieve OAuth token from Windows Credential Manager.
+pub fn retrieve_token_secure(email: &str) -> Result<Option<Vec<StoredTokenEntry>>> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .context("Failed to create keyring entry")?;
+
+    match entry.get_password() {
+        Ok(json) => {
+            let tokens: Vec<StoredTokenEntry> = serde_json::from_str(&json)
+                .context("Failed to parse stored token")?;
+            Ok(Some(tokens))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(err) => Err(anyhow!("Failed to retrieve token: {}", err)),
+    }
+}
+
+/// Delete OAuth token from Windows Credential Manager.
+pub fn delete_token_secure(email: &str) -> Result<()> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .context("Failed to create keyring entry")?;
+
+    match entry.delete_password() {
+        Ok(()) => {
+            tracing::info!(email = %email, "Token deleted from credential manager");
+            Ok(())
+        }
+        Err(keyring::Error::NoEntry) => Ok(()), // Already deleted
+        Err(err) => Err(anyhow!("Failed to delete token: {}", err)),
+    }
+}
+
+/// Check if a secure token exists for the given email.
+pub fn has_secure_token(email: &str) -> bool {
+    keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .and_then(|entry| entry.get_password())
+        .is_ok()
+}
+
+/// Migrate a file-based token to secure credential manager and delete the file.
+/// Returns Ok(true) if migration occurred, Ok(false) if no file existed.
+///
+/// Stores the raw JSON from yup-oauth2 without parsing into typed structs,
+/// as yup-oauth2's serialization format may differ from our StoredTokenEntry format.
+pub fn migrate_token_to_secure(email: &str, file_path: &Path) -> Result<bool> {
+    if !file_path.exists() {
+        return Ok(false);
+    }
+
+    let json = std::fs::read_to_string(file_path)
+        .context("Failed to read token file")?;
+
+    // Validate it's valid JSON without strict struct matching
+    // yup-oauth2 uses a different format for expires_at (object vs string)
+    let _: serde_json::Value = serde_json::from_str(&json)
+        .context("Failed to parse token file as JSON")?;
+
+    // Store the raw JSON in credential manager
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .context("Failed to create keyring entry")?;
+    entry.set_password(&json)
+        .context("Failed to store token in credential manager")?;
+
+    // Delete plaintext file
+    std::fs::remove_file(file_path)
+        .context("Failed to delete plaintext token file")?;
+
+    tracing::info!(email = %email, path = %file_path.display(), "Migrated token to credential manager");
+    Ok(true)
+}
+
+/// Restore token from credential manager to a temporary file for yup-oauth2 compatibility.
+/// Writes the raw JSON back exactly as it was stored (preserving yup-oauth2's format).
+/// Returns Ok(true) if restored, Ok(false) if no token exists.
+pub fn restore_token_to_file(email: &str, file_path: &Path) -> Result<bool> {
+    let entry = keyring::Entry::new(CREDENTIAL_SERVICE, email)
+        .context("Failed to create keyring entry")?;
+
+    match entry.get_password() {
+        Ok(json) => {
+            // Ensure parent directory exists
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+
+            // Write the raw JSON back exactly as stored
+            std::fs::write(file_path, json)
+                .context("Failed to write temporary token file")?;
+
+            tracing::debug!(email = %email, "Restored token from credential manager to temp file");
+            Ok(true)
+        }
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(err) => Err(anyhow!("Failed to retrieve token: {}", err)),
+    }
+}
+
 /// Fetch the Google profile picture URL for an account.
 ///
 /// Uses the OAuth2 userinfo endpoint which returns the user's public profile picture.
@@ -406,4 +585,143 @@ pub async fn fetch_profile_picture_url(
         serde_json::from_slice(&body_bytes).context("Failed to parse userinfo response")?;
 
     Ok(user_info.picture)
+}
+
+/// Manually exchange an authorization code for tokens.
+/// Used when automatic localhost redirect capture fails.
+///
+/// This function:
+/// 1. Parses the authorization code from the redirect URL
+/// 2. Exchanges the code for tokens via Google's token endpoint
+/// 3. Fetches the user's email from Gmail API
+/// 4. Writes the token cache in yup-oauth2 compatible format
+///
+/// # Arguments
+/// * `client_secret_path` - Path to client_secret.json
+/// * `redirect_url` - The full redirect URL including the code parameter
+/// * `token_dir` - Directory where token cache files are stored
+///
+/// # Returns
+/// Tuple of (email, token_cache_path)
+pub async fn exchange_auth_code_manually(
+    client_secret_path: &Path,
+    redirect_url: &str,
+    token_dir: &Path,
+) -> Result<(String, PathBuf)> {
+    tracing::info!("Manually exchanging auth code from redirect URL...");
+
+    // Parse the redirect URL to extract the code
+    let parsed_url = Url::parse(redirect_url)
+        .context("Invalid redirect URL format")?;
+
+    let code = parsed_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string())
+        .ok_or_else(|| anyhow!("No authorization code found in URL"))?;
+
+    // Extract redirect_uri from the URL (scheme://host:port/)
+    let redirect_uri = match parsed_url.port() {
+        Some(port) => format!(
+            "{}://{}:{}/",
+            parsed_url.scheme(),
+            parsed_url.host_str().unwrap_or("localhost"),
+            port
+        ),
+        None => format!(
+            "{}://{}/",
+            parsed_url.scheme(),
+            parsed_url.host_str().unwrap_or("localhost")
+        ),
+    };
+
+    tracing::debug!("Extracted code, using redirect_uri: {}", redirect_uri);
+
+    // Read client secret
+    let secret = oauth2::read_application_secret(client_secret_path)
+        .await
+        .context("Failed to read client_secret.json")?;
+
+    // Exchange code for tokens via HTTP POST
+    let http_client = reqwest::Client::new();
+    let token_response = http_client    
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("code", code.as_str()),
+            ("client_id", secret.client_id.as_str()),
+            ("client_secret", secret.client_secret.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .context("Failed to send token exchange request")?;
+
+    if !token_response.status().is_success() {
+        let error_text = token_response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Token exchange failed: {}. The authorization code may have expired.",
+            error_text
+        ));
+    }
+
+    let tokens: TokenExchangeResponse = token_response
+        .json()
+        .await
+        .context("Failed to parse token response")?;
+
+    tracing::debug!("Token exchange successful, fetching user profile...");
+
+    // Get user email from Gmail API using the access token
+    let profile_response = http_client
+        .get("https://www.googleapis.com/gmail/v1/users/me/profile")
+        .bearer_auth(&tokens.access_token)
+        .send()
+        .await
+        .context("Failed to fetch Gmail profile")?;
+
+    if !profile_response.status().is_success() {
+        let error_text = profile_response.text().await.unwrap_or_default();
+        return Err(anyhow!("Failed to get Gmail profile: {}", error_text));
+    }
+
+    let profile: GmailProfileResponse = profile_response
+        .json()
+        .await
+        .context("Failed to parse Gmail profile response")?;
+
+    let email = profile.email_address;
+    tracing::info!(email = %email, "Authenticated as");
+
+    // Calculate expiry time
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(tokens.expires_in as i64);
+    let expires_at_str = expires_at.to_rfc3339();
+
+    // Build token entry for storage
+    let token_entry = vec![StoredTokenEntry {
+        scopes: GMAIL_SCOPES.iter().map(|s| s.to_string()).collect(),
+        token: StoredToken {
+            access_token: Some(tokens.access_token),
+            refresh_token: tokens.refresh_token,
+            expires_at: Some(expires_at_str),
+            id_token: tokens.id_token,
+        },
+    }];
+
+    // Store token in secure credential manager (Windows Credential Manager / DPAPI)
+    store_token_secure(&email, &token_entry)?;
+
+    // Ensure token directory exists (still needed for yup-oauth2 compatibility path)
+    std::fs::create_dir_all(token_dir)
+        .context("Failed to create token directory")?;
+
+    // Generate token cache path (used as identifier in database, but file may not exist)
+    let token_cache_path = token_dir.join(AccountAuth::generate_token_path(&email));
+
+    tracing::info!(
+        email = %email,
+        "Token stored securely in credential manager"
+    );
+
+    Ok((email, token_cache_path))
 }

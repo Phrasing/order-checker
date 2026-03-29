@@ -3,6 +3,7 @@ import type {
   AccountViewModel,
   StatusFilter,
   SortMode,
+  SortDirection,
   TrackingStatusResponse,
   VirtualScrollState,
 } from './types';
@@ -14,6 +15,7 @@ export let allOrders: OrderViewModel[] = [];
 export let allAccounts: AccountViewModel[] = [];
 export let currentFilter: StatusFilter = 'all';
 export let currentSort: SortMode = 'date';
+export let currentSortDirection: SortDirection = 'desc';
 export let currentAccountId: number | null = null;
 export let currentDatePreset = '0';
 export let currentSearchQuery = '';
@@ -45,6 +47,7 @@ export function setAllOrders(v: OrderViewModel[]): void { allOrders = v; }
 export function setAllAccounts(v: AccountViewModel[]): void { allAccounts = v; }
 export function setCurrentFilter(v: StatusFilter): void { currentFilter = v; }
 export function setCurrentSort(v: SortMode): void { currentSort = v; }
+export function setCurrentSortDirection(v: SortDirection): void { currentSortDirection = v; }
 export function setCurrentAccountId(v: number | null): void { currentAccountId = v; }
 export function setCurrentDatePreset(v: string): void { currentDatePreset = v; }
 export function setCurrentSearchQuery(v: string): void { currentSearchQuery = v; }

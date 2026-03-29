@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
-use tracing_appender::rolling;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use walmart_dashboard::db::Database;
 use walmart_dashboard::tracking::TrackingService;
 
@@ -18,8 +18,13 @@ fn init_logging(log_dir: PathBuf) -> tracing_appender::non_blocking::WorkerGuard
     // Ensure log directory exists
     std::fs::create_dir_all(&log_dir).ok();
 
-    // Create daily rolling file appender
-    let file_appender = rolling::daily(&log_dir, "walmart-dashboard.log");
+    // Create daily rolling file appender with format: walmart-dashboard.YYYY-MM-DD.log
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("walmart-dashboard")
+        .filename_suffix("log")
+        .build(&log_dir)
+        .expect("Failed to create log file appender");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
     // Console layer: INFO level by default, compact format
@@ -55,8 +60,9 @@ fn init_logging(log_dir: PathBuf) -> tracing_appender::non_blocking::WorkerGuard
 
 fn main() {
     // Determine log directory - use app data dir or fallback to ./logs
+    // Uses com.order-checker.app to match Tauri's app identifier
     let log_dir = dirs::data_dir()
-        .map(|d| d.join("walmart-dashboard").join("logs"))
+        .map(|d| d.join("com.order-checker.app").join("logs"))
         .unwrap_or_else(|| PathBuf::from("logs"));
 
     // Initialize logging and keep guard alive for the entire app lifetime
@@ -95,10 +101,21 @@ fn main() {
             tracing::info!("Using database: {}", db_path.display());
 
             // Find client_secret.json for OAuth
-            let client_secret_paths = [
+            // Priority: 1) Dev paths, 2) Bundled resource, 3) App data dir
+            let mut client_secret_paths = vec![
                 PathBuf::from("client_secret.json"),
                 PathBuf::from("../client_secret.json"),
             ];
+
+            // Add bundled resource path (for production builds)
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                client_secret_paths.push(resource_dir.join("client_secret.json"));
+            }
+
+            // Add app data dir as fallback (user can manually place file there)
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                client_secret_paths.push(app_data_dir.join("client_secret.json"));
+            }
 
             let client_secret_path = client_secret_paths
                 .iter()
@@ -107,6 +124,7 @@ fn main() {
                 .unwrap_or_else(|| PathBuf::from("client_secret.json"));
 
             tracing::info!("Using client_secret: {}", client_secret_path.display());
+            tracing::debug!("Searched paths: {:?}", client_secret_paths);
 
             // Determine token cache directory — use app data dir so token files
             // don't land in the project tree (which would trigger the Tauri dev file watcher).
@@ -115,6 +133,14 @@ fn main() {
                 .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&token_dir).ok();
             tracing::info!("Using token dir: {}", token_dir.display());
+
+            // Determine models directory for ONNX models (background removal)
+            let models_dir = app.path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("models");
+            std::fs::create_dir_all(&models_dir).ok();
+            tracing::info!("Using models dir: {}", models_dir.display());
 
             // Ensure parent directory exists (synchronous, before async DB init)
             if let Some(parent) = db_path.parent() {
@@ -137,15 +163,21 @@ fn main() {
             let db = Arc::new(db);
             let tracking_service = TrackingService::new();
 
-            // Clone for background tasks before moving into AppState
-            let db_for_task = Arc::clone(&db);
-            let tracking_service_for_task = tracking_service.clone();
-            let app_handle = app.handle().clone();
+            // Migrate existing file-based tokens to secure credential storage
+            // This is a one-time migration for existing users
+            tauri::async_runtime::block_on(async {
+                migrate_existing_tokens(&db, &token_dir).await;
+            });
 
             let db_for_email_check = Arc::clone(&db);
             let client_secret_for_check = client_secret_path.clone();
             let token_dir_for_check = token_dir.clone();
             let app_handle_for_check = app.handle().clone();
+
+            // Clone for image reprocessing task
+            let db_for_image_check = Arc::clone(&db);
+            let models_dir_for_check = models_dir.clone();
+            let app_handle_for_image_check = app.handle().clone();
 
             app.manage(AppState {
                 db,
@@ -153,46 +185,8 @@ fn main() {
                 client_secret_path,
                 tracking_service,
                 token_dir,
+                models_dir,
                 auth_cancel: std::sync::Mutex::new(None),
-            });
-
-            // Spawn background tracking fetch task
-            tauri::async_runtime::spawn(async move {
-                // Let app fully initialize first
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-                tracing::info!("Starting background tracking fetch...");
-
-                let db = &*db_for_task;
-
-                // Batch fetch orders missing cached tracking data
-                if let Err(e) =
-                    walmart_dashboard::tracking::fetch_missing_tracking_batch(db, &tracking_service_for_task)
-                        .await
-                {
-                    tracing::error!("Failed to fetch missing tracking: {}", e);
-                }
-
-                // Batch refresh stale entries (>4 hours old, not delivered)
-                if let Err(e) =
-                    walmart_dashboard::tracking::refresh_stale_tracking_batch(db, &tracking_service_for_task, 4)
-                        .await
-                {
-                    tracing::error!("Failed to refresh stale tracking: {}", e);
-                }
-
-                // Sync order status from tracking data (shipped -> delivered)
-                if let Err(e) = walmart_dashboard::tracking::sync_delivered_from_tracking(db).await
-                {
-                    tracing::error!("Failed to sync delivered orders: {}", e);
-                }
-
-                tracing::info!("Background tracking fetch complete");
-
-                // Emit event to notify frontend that sync is complete
-                if let Err(e) = app_handle.emit("tracking-sync-complete", ()) {
-                    tracing::error!("Failed to emit tracking-sync-complete event: {}", e);
-                }
             });
 
             // Spawn background new-email check task
@@ -215,6 +209,74 @@ fn main() {
                 }
             });
 
+            // Spawn background task to check ONNX availability on startup
+            // and reprocess non-transparent images if ONNX is now available
+            tauri::async_runtime::spawn(async move {
+                // Wait a bit for app to initialize
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                tracing::info!("Checking ONNX/background removal availability...");
+
+                // Try to create an ImageProcessor with ONNX
+                match walmart_dashboard::images::ImageProcessor::new(
+                    db_for_image_check.pool().clone(),
+                    &models_dir_for_check,
+                ).await {
+                    Ok((processor, onnx_status)) => {
+                        // Check if ONNX is actually working (not NoopRemover)
+                        if let Some(walmart_dashboard::images::OnnxStatus::NeedsVcRedist(_)) = &onnx_status {
+                            tracing::warn!("ONNX unavailable - prompting user to install VC++ Redistributable");
+                            // Emit event immediately so user is prompted on startup
+                            let _ = app_handle_for_image_check.emit("onnx-unavailable", serde_json::json!({
+                                "message": "Background removal unavailable. Install Visual C++ Redistributable for transparent product images.",
+                                "download_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+                            }));
+                            return;
+                        }
+
+                        tracing::info!("ONNX background removal is available");
+
+                        // Check if there are any non-transparent images to reprocess
+                        let non_transparent_count: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM images WHERE is_transparent = 0"
+                        )
+                        .fetch_one(db_for_image_check.pool())
+                        .await
+                        .unwrap_or(0);
+
+                        if non_transparent_count == 0 {
+                            tracing::debug!("No non-transparent images to reprocess");
+                            return;
+                        }
+
+                        // ONNX is working and there are non-transparent images - reprocess them
+                        tracing::info!(
+                            "Found {} non-transparent images, reprocessing with background removal...",
+                            non_transparent_count
+                        );
+
+                        match processor.reprocess_non_transparent_images().await {
+                            Ok(count) => {
+                                if count > 0 {
+                                    tracing::info!("Successfully reprocessed {} images with transparency", count);
+                                    // Notify frontend to refresh
+                                    let _ = app_handle_for_image_check.emit("images-reprocessed", serde_json::json!({
+                                        "count": count,
+                                        "message": format!("Reprocessed {} images with transparent backgrounds", count)
+                                    }));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to reprocess images: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Could not initialize ImageProcessor: {}", e);
+                    }
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -223,19 +285,24 @@ fn main() {
             commands::fetch_more_orders,
             commands::search_orders,
             commands::get_aggregate_stats,
+            commands::get_upcoming_deliveries,
             commands::get_db_path,
             commands::get_tracking_status,
             commands::fetch_tracking,
             commands::get_cached_image,
             commands::get_cached_thumbnails,
             commands::list_accounts,
+            commands::refresh_shipped_tracking,
             commands::restart_tracking_session,
             commands::process_emails,
             commands::sync_and_process_orders,
             commands::check_new_emails,
             commands::add_account,
             commands::cancel_add_account,
+            commands::complete_auth_with_code,
             commands::remove_account,
+            commands::clear_all_data,
+            commands::check_onnx_status,
         ])
         .build(tauri::generate_context!())
         .expect("Error while building Tauri application")
@@ -252,4 +319,61 @@ fn main() {
                 }
             }
         });
+}
+
+/// Migrate existing file-based tokens to secure credential storage (Windows Credential Manager).
+/// This is a one-time migration for users who have existing token files.
+async fn migrate_existing_tokens(
+    db: &std::sync::Arc<walmart_dashboard::db::Database>,
+    token_dir: &std::path::Path,
+) {
+    use walmart_dashboard::auth;
+
+    // Get all active accounts from database
+    let accounts = match db.list_accounts().await {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            tracing::warn!("Failed to list accounts for token migration: {}", err);
+            return;
+        }
+    };
+
+    if accounts.is_empty() {
+        return;
+    }
+
+    tracing::info!("Checking {} accounts for token migration to secure storage...", accounts.len());
+
+    let mut migrated = 0;
+    for account in accounts {
+        // Resolve the token path
+        let token_path = std::path::PathBuf::from(&account.token_cache_path);
+        let resolved_path = if token_path.is_absolute() {
+            token_path
+        } else {
+            token_dir.join(token_path)
+        };
+
+        // Check if file exists and credential manager doesn't have the token
+        if resolved_path.exists() && !auth::has_secure_token(&account.email) {
+            match auth::migrate_token_to_secure(&account.email, &resolved_path) {
+                Ok(true) => {
+                    tracing::info!(email = %account.email, "Migrated token to secure storage");
+                    migrated += 1;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        email = %account.email,
+                        error = %err,
+                        "Failed to migrate token to secure storage"
+                    );
+                }
+            }
+        }
+    }
+
+    if migrated > 0 {
+        tracing::info!("Migrated {} token(s) to secure credential storage", migrated);
+    }
 }

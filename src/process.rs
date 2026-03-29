@@ -356,9 +356,18 @@ pub async fn process_pending_events_concurrent(
                 }
                 Err(e) => {
                     let error_msg = format!("{:#}", e);
-                    batch_stats.failed += 1;
-                    db_failed_entries.push((parsed.id, error_msg.clone()));
-                    tracing::warn!("Failed to process confirmation email {}: {}", parsed.gmail_id, error_msg);
+                    if is_db_lock_error(&error_msg) {
+                        deferred_batch_ids.push(parsed.id);
+                        batch_stats.failed += 1;
+                        tracing::warn!(
+                            "Database locked processing confirmation {}, deferring for retry",
+                            parsed.gmail_id
+                        );
+                    } else {
+                        batch_stats.failed += 1;
+                        db_failed_entries.push((parsed.id, error_msg.clone()));
+                        tracing::warn!("Failed to process confirmation email {}: {}", parsed.gmail_id, error_msg);
+                    }
                 }
             }
         }
@@ -438,9 +447,18 @@ pub async fn process_pending_events_concurrent(
                 }
                 Err(e) => {
                     let error_msg = format!("{:#}", e);
-                    batch_stats.failed += 1;
-                    db_failed_entries.push((parsed.id, error_msg.clone()));
-                    tracing::warn!("Failed to process update email {}: {}", parsed.gmail_id, error_msg);
+                    if is_db_lock_error(&error_msg) {
+                        deferred_batch_ids.push(parsed.id);
+                        batch_stats.failed += 1;
+                        tracing::warn!(
+                            "Database locked processing update {}, deferring for retry",
+                            parsed.gmail_id
+                        );
+                    } else {
+                        batch_stats.failed += 1;
+                        db_failed_entries.push((parsed.id, error_msg.clone()));
+                        tracing::warn!("Failed to process update email {}: {}", parsed.gmail_id, error_msg);
+                    }
                 }
             }
         }
@@ -584,6 +602,7 @@ enum ProcessResult {
 }
 
 /// Fetch all pending raw emails from the database
+#[tracing::instrument(skip_all, fields(limit))]
 async fn fetch_pending_emails(db: &Database, limit: i64) -> Result<Vec<RawEmail>> {
     // Order by date, but prioritize confirmations first within the same date
     // This ensures orders are created from confirmations before other events update them
@@ -673,32 +692,57 @@ fn build_normalized_name_map(names: &[String]) -> HashMap<String, Vec<String>> {
 /// Parse a single email without writing to DB (CPU-bound, parallelizable)
 fn parse_single_email(
     parser: &WalmartEmailParser,
-    email: RawEmail,
+    mut email: RawEmail,
 ) -> Result<ParsedEmail, (i64, String, String)> {
+    let _span = tracing::info_span!("parse_email", gmail_id = %email.gmail_id, body_len = email.raw_body.len()).entered();
+
     // Decode quoted-printable encoding if present.
     // Soft line breaks (= followed by newline) are the definitive QP marker.
     // Avoid checking for =20 or =3D which can appear in decoded HTML (URLs, CSS).
     let needs_decode = email.raw_body.contains("=\r\n") || email.raw_body.contains("=\n");
     let html = if needs_decode {
+        let _qp_span = tracing::debug_span!("qp_decode").entered();
         decode_quoted_printable(&email.raw_body)
     } else {
-        email.raw_body.clone()
+        // Move the string instead of cloning — email.raw_body is consumed anyway
+        std::mem::take(&mut email.raw_body)
     };
 
     // Detect email type: prefer subject line (high-confidence, short text),
     // fall back to full HTML body scan (lower confidence due to footer/boilerplate text)
-    let email_type = email.subject.as_deref()
-        .and_then(|s| parser.detect_email_type_from_subject(s))
-        .unwrap_or_else(|| parser.detect_email_type(&html));
+    let email_type = {
+        let _detect_span = tracing::debug_span!("detect_type").entered();
+        email.subject.as_deref()
+            .and_then(|sub| parser.detect_email_type_from_subject(sub))
+            .unwrap_or_else(|| parser.detect_email_type_raw(&html))
+    };
 
     // Convert gmail_date (millis string) to DateTime for date fallback
     let fallback_date = email.gmail_date.as_ref()
-        .and_then(|d| d.parse::<i64>().ok())
+        .and_then(|date_str| date_str.parse::<i64>().ok())
         .and_then(chrono::DateTime::from_timestamp_millis);
 
     // Parse order if it's a known type
     let order = if email_type != EmailType::Unknown {
-        match parser.parse_order(&html, fallback_date) {
+        let _order_span = tracing::debug_span!("parse_order", email_type = ?email_type).entered();
+
+        // Fast path: shipping and delivery emails can often be parsed with
+        // pure regex/string extraction, avoiding expensive DOM construction.
+        // Falls back to full parse_order() on None.
+        let fast_result = match email_type {
+            EmailType::Shipping => parser.parse_shipping_fast(&html, fallback_date),
+            EmailType::Delivery => parser.parse_delivery_fast(&html, fallback_date),
+            EmailType::Cancellation => parser.parse_cancellation_fast(&html, fallback_date),
+            _ => None,
+        };
+
+        let parse_result = if let Some(order) = fast_result {
+            Ok(order)
+        } else {
+            parser.parse_order(&html, fallback_date)
+        };
+
+        match parse_result {
             Ok(mut order) => {
                 order.account_id = email.account_id;
                 order.recipient = email.recipient.clone();
@@ -712,8 +756,8 @@ fn parse_single_email(
                 }
                 Some(order)
             }
-            Err(e) => {
-                return Err((email.id, email.gmail_id.clone(), format!("{:#}", e)));
+            Err(err) => {
+                return Err((email.id, email.gmail_id.clone(), format!("{:#}", err)));
             }
         }
     } else {
@@ -731,6 +775,7 @@ fn parse_single_email(
 
 
 /// Apply a parsed email to the database within a transaction
+#[tracing::instrument(skip_all, fields(gmail_id = %parsed.gmail_id, email_type = ?parsed.email_type))]
 async fn apply_parsed_email_to_db_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     parsed: &ParsedEmail,
@@ -941,10 +986,20 @@ async fn apply_delivery_tx<'a>(
 // ============================================================================
 
 
-/// Process missing product images via rembg server and cache the results.
+/// Result of processing missing product images.
+#[derive(Debug, Clone)]
+pub struct ImageProcessingResult {
+    /// Number of images processed
+    pub processed: usize,
+    /// If ONNX failed, contains the error message suggesting VC++ installation
+    pub onnx_error: Option<String>,
+}
+
 /// Process product images that haven't been downloaded/cached yet.
+/// Uses local rembg-rs for background removal (model auto-downloaded on first use).
 /// Separated from `process_pending_events` to allow concurrent execution with tracking.
-pub async fn process_missing_product_images(db: &Database) -> Result<()> {
+/// Returns ImageProcessingResult with onnx_error set if VC++ Redistributable is needed.
+pub async fn process_missing_product_images(db: &Database, models_dir: &std::path::Path) -> Result<ImageProcessingResult> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT image_url FROM line_items WHERE image_url IS NOT NULL AND image_url != ''"
     )
@@ -952,7 +1007,10 @@ pub async fn process_missing_product_images(db: &Database) -> Result<()> {
     .await?;
 
     if rows.is_empty() {
-        return Ok(());
+        return Ok(ImageProcessingResult {
+            processed: 0,
+            onnx_error: None,
+        });
     }
 
     let mut url_ids: Vec<(String, String)> = Vec::with_capacity(rows.len());
@@ -987,32 +1045,51 @@ pub async fn process_missing_product_images(db: &Database) -> Result<()> {
         .collect();
 
     if missing.is_empty() {
-        let processor = ImageProcessor::new_rembg_http_default(db.pool().clone()).await?;
+        let processor = ImageProcessor::new_noop(db.pool().clone()).await?;
         let created = processor.process_missing_thumbnails().await?;
         if created > 0 {
             tracing::info!("Backfilled {} image thumbnails", created);
         }
-        return Ok(());
+        return Ok(ImageProcessingResult {
+            processed: 0,
+            onnx_error: None,
+        });
     }
 
     tracing::info!(
-        "Processing {} product images via rembg server",
+        "Processing {} product images via local rembg",
         missing.len()
     );
 
-    let processor = ImageProcessor::new_rembg_http_default(db.pool().clone()).await?;
+    let missing_count = missing.len();
+    let (processor, onnx_status) = ImageProcessor::new(db.pool().clone(), models_dir).await?;
+
+    // Extract error message if ONNX failed
+    let onnx_error = match onnx_status {
+        Some(crate::images::OnnxStatus::NeedsVcRedist(err)) => {
+            tracing::warn!("ONNX unavailable, images will not have transparent backgrounds: {}", err);
+            Some("Background removal unavailable. Install Visual C++ Redistributable for transparent product images.".to_string())
+        }
+        _ => None,
+    };
+
     let _ = processor.process_batch(missing).await?;
     let created = processor.process_missing_thumbnails().await?;
     if created > 0 {
         tracing::info!("Backfilled {} image thumbnails", created);
     }
-    Ok(())
+
+    Ok(ImageProcessingResult {
+        processed: missing_count,
+        onnx_error,
+    })
 }
 
 // ============================================================================
 // Transaction-aware database helper functions
 // ============================================================================
 
+#[tracing::instrument(skip_all, fields(order_id = %order.id))]
 async fn insert_order_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     order: &WalmartOrder,
@@ -1092,6 +1169,7 @@ async fn fetch_line_item_names_tx<'a>(
     Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
+#[tracing::instrument(skip_all, fields(order_id, item_count = items.len()))]
 async fn insert_line_items_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     order_id: &str,
@@ -1131,6 +1209,7 @@ async fn insert_line_items_tx<'a>(
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(order_id, item_count = items.len(), status = ?status))]
 async fn upsert_items_for_event_tx<'a>(
     tx: &mut sqlx::Transaction<'a, Sqlite>,
     order_id: &str,
@@ -1328,6 +1407,7 @@ async fn record_email_event_tx<'a>(
 
 
 /// Batch mark multiple emails as processed
+#[tracing::instrument(skip_all, fields(count = ids.len()))]
 async fn batch_mark_emails_processed(db: &Database, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -1352,6 +1432,7 @@ async fn batch_mark_emails_processed(db: &Database, ids: &[i64]) -> Result<()> {
 }
 
 /// Batch mark multiple emails as skipped
+#[tracing::instrument(skip_all, fields(count = ids.len()))]
 async fn batch_mark_emails_skipped(db: &Database, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -1376,6 +1457,7 @@ async fn batch_mark_emails_skipped(db: &Database, ids: &[i64]) -> Result<()> {
 
 /// Mark emails as deferred (missing order, will retry after all batches).
 /// Unlike batch_mark_emails_skipped, this does NOT clear raw_body.
+#[tracing::instrument(skip_all, fields(count = ids.len()))]
 async fn batch_mark_emails_deferred(db: &Database, ids: &[i64]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -1407,6 +1489,7 @@ async fn reset_deferred_to_pending(db: &Database) -> Result<u64> {
 }
 
 /// Batch mark multiple emails as failed with their error messages
+#[tracing::instrument(skip_all, fields(count = entries.len()))]
 async fn batch_mark_emails_failed(db: &Database, entries: &[(i64, String)]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -1426,6 +1509,13 @@ async fn batch_mark_emails_failed(db: &Database, entries: &[(i64, String)]) -> R
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Check if an error message indicates a transient SQLite lock contention.
+/// These should be deferred for retry rather than permanently failed.
+fn is_db_lock_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("database is locked") || lower.contains("database is busy")
 }
 
 #[cfg(test)]

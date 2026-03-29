@@ -93,14 +93,25 @@ pub struct DashboardDataV2 {
     pub last_updated: String,
 }
 
+/// Tracking status breakdown for shipped orders
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrackingBreakdown {
+    pub label_created: i64,
+    pub in_transit: i64,
+    pub out_for_delivery: i64,
+    pub delivered: i64,
+    pub exception: i64,
+    pub available_for_pickup: i64,
+    pub unknown: i64,
+}
+
 /// Aggregate statistics calculated efficiently without fetching full order data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateStats {
     pub total_orders: i64,
     pub total_spent: f64,
-    pub avg_order: f64,
     pub total_quantity: i64,
-    pub orders_this_week: i64,
+    pub tracking_breakdown: TrackingBreakdown,
 }
 
 /// Get dashboard data - public API for Tauri and other consumers
@@ -238,24 +249,6 @@ fn build_order_view_models(
     orders
 }
 
-/// Fetch all orders with their line items (2 queries instead of N+1)
-pub async fn fetch_orders_with_items(db: &Database) -> Result<Vec<OrderViewModel>> {
-    let order_rows: Vec<(String, String, Option<String>, Option<f64>, String, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT id, order_date, shipped_date, total_cost, status, tracking_number, carrier, recipient, cancel_reason
-        FROM orders
-        ORDER BY COALESCE(CASE WHEN status IN ('shipped','delivered') THEN shipped_date END, order_date) DESC
-        "#
-    )
-    .fetch_all(db.pool())
-    .await?;
-
-    let order_ids: Vec<&str> = order_rows.iter().map(|(id, ..)| id.as_str()).collect();
-    let items_by_order = fetch_items_for_orders(db, &order_ids).await?;
-
-    Ok(build_order_view_models(order_rows, items_by_order))
-}
-
 /// Format ISO date to a readable format
 fn format_date(iso_date: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(iso_date)
@@ -280,21 +273,6 @@ fn normalize_date_for_sorting(date_str: &str) -> String {
     }
     // Unrecognized — return as-is
     date_str.to_string()
-}
-
-/// Fetch count of pending emails
-pub async fn fetch_pending_email_count(db: &Database) -> Result<i64> {
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM raw_emails WHERE processing_status = 'pending'"
-    )
-    .fetch_one(db.pool())
-    .await?;
-    Ok(count)
-}
-
-/// Fetch counts by order status
-pub async fn fetch_status_counts(db: &Database) -> Result<StatusCounts> {
-    fetch_status_counts_filtered(db, None).await
 }
 
 // ==================== Account-Filtered Functions ====================
@@ -328,14 +306,6 @@ pub async fn fetch_account_view_models(db: &Database) -> Result<Vec<AccountViewM
             }
         })
         .collect())
-}
-
-/// Fetch orders filtered by account
-pub async fn fetch_orders_with_items_filtered(
-    db: &Database,
-    account_id: Option<i64>,
-) -> Result<Vec<OrderViewModel>> {
-    fetch_orders_with_items_and_dates(db, account_id, None, None).await
 }
 
 /// Fetch orders filtered by account and date range
@@ -651,7 +621,7 @@ pub async fn search_orders(
 }
 
 /// Fetch aggregate statistics efficiently without loading full order data
-/// Calculates totals, averages, and counts using database aggregation
+/// Calculates totals and tracking breakdown using database aggregation
 pub async fn fetch_aggregate_stats(
     db: &Database,
     account_id: Option<i64>,
@@ -685,17 +655,15 @@ pub async fn fetch_aggregate_stats(
         "SELECT
             COUNT(*) as total_orders,
             COALESCE(SUM(total_cost), 0) as total_spent,
-            COALESCE(AVG(total_cost), 0) as avg_order,
             (SELECT COALESCE(SUM(quantity), 0) FROM line_items
-             WHERE order_id IN (SELECT id FROM orders {})) as total_quantity,
-            COUNT(CASE WHEN date({}) >= date('now', '-7 days') THEN 1 END) as orders_this_week
+             WHERE order_id IN (SELECT id FROM orders {})) as total_quantity
          FROM orders {}",
-        where_clause, EFF_DATE, where_clause
+        where_clause, where_clause
     );
 
-    let mut query = sqlx::query_as::<_, (i64, f64, f64, i64, i64)>(&sql);
+    let mut query = sqlx::query_as::<_, (i64, f64, i64)>(&sql);
 
-    // Bind parameters
+    // Bind parameters for subquery
     if let Some(acc_id) = account_id {
         query = query.bind(acc_id);
     }
@@ -706,7 +674,7 @@ pub async fn fetch_aggregate_stats(
         query = query.bind(end);
     }
 
-    // Bind again for the subquery
+    // Bind again for the main query
     if let Some(acc_id) = account_id {
         query = query.bind(acc_id);
     }
@@ -717,20 +685,70 @@ pub async fn fetch_aggregate_stats(
         query = query.bind(end);
     }
 
-    let (total_orders, total_spent, avg_order, total_quantity, orders_this_week) =
+    let (total_orders, total_spent, total_quantity) =
         query.fetch_one(db.pool()).await?;
 
+    // Fetch tracking breakdown for shipped orders
+    let mut tracking_conditions: Vec<String> = vec!["o.status = 'shipped'".to_string()];
+
+    if account_id.is_some() {
+        tracking_conditions.push("o.account_id = ?".to_string());
+    }
+    if start_date.is_some() {
+        tracking_conditions.push(format!("substr({}, 1, 10) >= ?", EFF_DATE.replace("status", "o.status").replace("shipped_date", "o.shipped_date").replace("order_date", "o.order_date")));
+    }
+    if end_date.is_some() {
+        tracking_conditions.push(format!("substr({}, 1, 10) <= ?", EFF_DATE.replace("status", "o.status").replace("shipped_date", "o.shipped_date").replace("order_date", "o.order_date")));
+    }
+
+    let tracking_where = format!("WHERE {}", tracking_conditions.join(" AND "));
+
+    let tracking_sql = format!(
+        "SELECT COALESCE(tc.state, 'unknown') as state, COUNT(*) as count
+         FROM orders o
+         LEFT JOIN tracking_cache tc ON o.id = tc.order_id
+         {}
+         GROUP BY tc.state",
+        tracking_where
+    );
+
+    let mut tracking_query = sqlx::query_as::<_, (String, i64)>(&tracking_sql);
+
+    if let Some(acc_id) = account_id {
+        tracking_query = tracking_query.bind(acc_id);
+    }
+    if let Some(start) = start_date {
+        tracking_query = tracking_query.bind(start);
+    }
+    if let Some(end) = end_date {
+        tracking_query = tracking_query.bind(end);
+    }
+
+    let tracking_rows = tracking_query.fetch_all(db.pool()).await?;
+
+    let mut tracking_breakdown = TrackingBreakdown::default();
+    for (state, count) in tracking_rows {
+        match state.as_str() {
+            "label_created" => tracking_breakdown.label_created = count,
+            "in_transit" => tracking_breakdown.in_transit = count,
+            "out_for_delivery" => tracking_breakdown.out_for_delivery = count,
+            "delivered" => tracking_breakdown.delivered = count,
+            "exception" => tracking_breakdown.exception = count,
+            "available_for_pickup" => tracking_breakdown.available_for_pickup = count,
+            _ => tracking_breakdown.unknown += count,
+        }
+    }
+
     tracing::debug!(
-        "Aggregate stats: total_orders={}, total_spent={:.2}, avg_order={:.2}",
-        total_orders, total_spent, avg_order
+        "Aggregate stats: total_orders={}, total_spent={:.2}, tracking={:?}",
+        total_orders, total_spent, tracking_breakdown
     );
 
     Ok(AggregateStats {
         total_orders,
         total_spent,
-        avg_order,
         total_quantity,
-        orders_this_week,
+        tracking_breakdown,
     })
 }
 

@@ -1,4 +1,4 @@
-import type { OrderViewModel, DateRangeParams } from './types';
+import type { OrderViewModel, DateRangeParams, SortDirection } from './types';
 import { currentDatePreset, statusPriority } from './state';
 
 // HTML escaping
@@ -128,13 +128,50 @@ export function searchOrders(orders: OrderViewModel[], query: string): OrderView
   );
 }
 
-export function sortOrders(orders: OrderViewModel[], sortBy: string): OrderViewModel[] {
+export function sortOrders(
+  orders: OrderViewModel[],
+  sortBy: string,
+  direction: SortDirection = 'desc',
+): OrderViewModel[] {
+  const dir = direction === 'asc' ? 1 : -1;
+
   return [...orders].sort((a, b) => {
-    if (sortBy === 'status') {
-      const priorityA = statusPriority[a.status] ?? 99;
-      const priorityB = statusPriority[b.status] ?? 99;
-      if (priorityA !== priorityB) return priorityA - priorityB;
+    let cmp = 0;
+
+    switch (sortBy) {
+      case 'date':
+        cmp = new Date(a.order_date_raw).getTime() - new Date(b.order_date_raw).getTime();
+        break;
+
+      case 'price': {
+        const priceA = parseFloat(a.total_cost || '0');
+        const priceB = parseFloat(b.total_cost || '0');
+        cmp = priceA - priceB;
+        break;
+      }
+
+      case 'status': {
+        const pA = statusPriority[a.status] ?? 99;
+        const pB = statusPriority[b.status] ?? 99;
+        cmp = pA - pB;
+        break;
+      }
+
+      case 'quantity': {
+        const qA = a.items?.reduce((s, i) => s + (i.quantity || 1), 0) || 0;
+        const qB = b.items?.reduce((s, i) => s + (i.quantity || 1), 0) || 0;
+        cmp = qA - qB;
+        break;
+      }
+
+      case 'items': {
+        cmp = (a.items?.length || 0) - (b.items?.length || 0);
+        break;
+      }
     }
+
+    // Primary sort with direction, secondary sort by date desc for ties
+    if (cmp !== 0) return cmp * dir;
     return new Date(b.order_date_raw).getTime() - new Date(a.order_date_raw).getTime();
   });
 }

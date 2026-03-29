@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use tracing_appender::rolling;
+use tracing_chrome::ChromeLayerBuilder;
 
 use walmart_dashboard::{
     auth::{self, AccountAuth},
@@ -22,6 +23,10 @@ struct Cli {
     /// Path to the SQLite database file
     #[arg(short, long, default_value = "orders.db")]
     database: PathBuf,
+
+    /// Enable Chrome trace profiling (writes trace-{timestamp}.json)
+    #[arg(long)]
+    trace: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -202,12 +207,15 @@ async fn main() -> Result<()> {
     // Load .env file if present
     let _ = dotenvy::dotenv();
 
+    // Parse CLI early so we know if --trace is set before initializing logging
+    let cli = Cli::parse();
+
     // Initialize logging with file output
     let log_dir = PathBuf::from("logs");
     std::fs::create_dir_all(&log_dir).ok();
 
     let file_appender = rolling::daily(&log_dir, "walmart-cli.log");
-    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+    let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
 
     // Console layer: INFO level by default, compact format
     let console_layer = tracing_subscriber::fmt::layer()
@@ -230,12 +238,28 @@ async fn main() -> Result<()> {
             "info,walmart_dashboard=debug,html5ever=warn,markup5ever=warn,selectors=warn"
         ));
 
+    // Chrome trace layer: only enabled with --trace flag
+    // Writes a trace-{timestamp}.json file that can be opened in chrome://tracing or Perfetto
+    // IMPORTANT: Must filter to our crate only — unfiltered sqlx/tokio/hyper spans produce
+    // hundreds of thousands of events that exhaust memory on large workloads.
+    let (chrome_layer, _chrome_guard) = if cli.trace {
+        let (layer, guard) = ChromeLayerBuilder::new()
+            .include_args(true)
+            .build();
+        println!("Chrome trace profiling enabled. Trace file will be written on exit.");
+        let filtered = layer.with_filter(tracing_subscriber::EnvFilter::new(
+            "walmart_dashboard=debug"
+        ));
+        (Some(filtered), Some(guard))
+    } else {
+        (None, None)
+    };
+
     tracing_subscriber::registry()
         .with(console_layer)
         .with(file_layer)
+        .with(chrome_layer)
         .init();
-
-    let cli = Cli::parse();
 
     // Create database connection
     let db_path = cli.database;
@@ -636,11 +660,7 @@ async fn main() -> Result<()> {
                 println!("Cleared {} thumbnails", result.rows_affected());
             }
 
-            let processor = images::ImageProcessor::new(
-                db.pool().clone(),
-                Arc::new(images::NoopRemover),
-            )
-            .await?;
+            let processor = images::ImageProcessor::new_noop(db.pool().clone()).await?;
 
             let created = processor.process_missing_thumbnails().await?;
             println!("Backfilled {} thumbnails", created);
@@ -706,12 +726,21 @@ async fn main() -> Result<()> {
                 .filter_map(|(url, id)| if existing.contains(&id) { None } else { Some(url) })
                 .collect();
 
-            let processor = images::ImageProcessor::new_rembg_http_default(db.pool().clone()).await?;
+            let models_dir = dirs::data_dir()
+                .map(|d| d.join("walmart-dashboard").join("models"))
+                .unwrap_or_else(|| PathBuf::from("models"));
+
+            let (processor, onnx_status) = images::ImageProcessor::new(db.pool().clone(), &models_dir).await?;
+
+            if let Some(images::OnnxStatus::NeedsVcRedist(err)) = onnx_status {
+                eprintln!("Warning: ONNX unavailable - {}. Images will not have transparent backgrounds.", err);
+                eprintln!("Install Visual C++ Redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe");
+            }
 
             if missing.is_empty() {
                 println!("No missing images. Checking thumbnails...");
             } else {
-                println!("Processing {} product images via rembg server", missing.len());
+                println!("Processing {} product images via local rembg", missing.len());
                 let _ = processor.process_batch(missing).await?;
             }
 

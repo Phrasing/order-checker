@@ -4,7 +4,6 @@ import {
   currentSearchQuery,
   lastUpdatedText,
   fetchSinceDate,
-  currentAccountId,
   setCurrentFilter,
   setCurrentDatePreset,
   setCurrentSearchQuery,
@@ -12,8 +11,6 @@ import {
   setLastUpdatedText,
   filterTitles,
 } from '../state';
-import * as api from '../api';
-import { getDateRangeParams } from '../utils';
 
 // These are imported lazily to avoid circular dependency issues at module evaluation time.
 // Both loadDashboard and applyFiltersAndRender are only called from event handlers (not at import time).
@@ -58,29 +55,6 @@ export function renderSidebar(data: DashboardData | DashboardDataV2): void {
   el('pending-emails')!.textContent = `${data.pending_emails || 0} pending emails`;
   setLastUpdatedText(data.last_updated || '');
   el('last-updated')!.textContent = lastUpdatedText;
-}
-
-export async function renderStats(): Promise<void> {
-  try {
-    const { startDate, endDate } = getDateRangeParams();
-    const stats = await api.getAggregateStats(
-      currentAccountId,
-      startDate,
-      endDate
-    );
-
-    document.getElementById('stat-total-spent')!.textContent = '$' + stats.total_spent.toFixed(2);
-    document.getElementById('stat-total-qty')!.textContent = stats.total_quantity.toLocaleString();
-    document.getElementById('stat-avg-order')!.textContent = '$' + stats.avg_order.toFixed(2);
-    document.getElementById('stat-this-week')!.textContent = stats.orders_this_week + ' orders';
-  } catch (error) {
-    console.error('Failed to load aggregate stats:', error);
-    // Show error state in stats
-    document.getElementById('stat-total-spent')!.textContent = '-';
-    document.getElementById('stat-total-qty')!.textContent = '-';
-    document.getElementById('stat-avg-order')!.textContent = '-';
-    document.getElementById('stat-this-week')!.textContent = '-';
-  }
 }
 
 export function updateHeader(): void {
@@ -158,7 +132,7 @@ export function setupFetchSincePicker(): void {
 
 function updateFetchSinceHint(hint: HTMLElement, dateStr: string | null): void {
   if (!dateStr) {
-    hint.textContent = 'Default: last 5 days';
+    hint.textContent = 'Default: last 60 days';
     hint.className = 'fetch-since-hint';
     return;
   }

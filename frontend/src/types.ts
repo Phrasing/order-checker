@@ -68,12 +68,21 @@ export interface DashboardDataV2 {
   last_updated: string;
 }
 
+export interface TrackingBreakdown {
+  label_created: number;
+  in_transit: number;
+  out_for_delivery: number;
+  delivered: number;
+  exception: number;
+  available_for_pickup: number;
+  unknown: number;
+}
+
 export interface AggregateStats {
   total_orders: number;
   total_spent: number;
-  avg_order: number;
   total_quantity: number;
-  orders_this_week: number;
+  tracking_breakdown: TrackingBreakdown;
 }
 
 export interface VirtualScrollState {
@@ -107,6 +116,7 @@ export interface TrackingStatusResponse {
   state_description: string | null;
   is_delivered: boolean;
   delivery_date: string | null;
+  estimated_delivery: string | null;
   last_fetched_at: string;
   events: TrackingEventResponse[];
 }
@@ -124,7 +134,8 @@ export interface SyncProgress {
 }
 
 export type StatusFilter = 'all' | 'confirmed' | 'shipped' | 'delivered' | 'canceled' | 'partially_canceled';
-export type SortMode = 'date' | 'status';
+export type SortMode = 'date' | 'price' | 'status' | 'quantity' | 'items';
+export type SortDirection = 'asc' | 'desc';
 
 export interface DateRangeParams {
   startDate: string | null;
@@ -135,4 +146,16 @@ export interface TimelineEvent {
   time: string;
   description: string;
   location: string | null;
+}
+
+export interface UpcomingDelivery {
+  order_id: string;
+  tracking_number: string;
+  carrier: string;
+  estimated_delivery: string;
+  state: string;
+  state_display: string;
+  item_name: string | null;
+  item_count: number;
+  image_id: string | null;
 }

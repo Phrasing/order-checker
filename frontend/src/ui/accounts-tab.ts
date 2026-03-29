@@ -46,14 +46,16 @@ function renderAccountsPage(): void {
   }
 
   container.innerHTML = `
-    <div class="accounts-page-header">
-      <h2 class="accounts-page-title">Connected Accounts</h2>
-      <p class="accounts-page-subtitle">${accounts.length} account${accounts.length !== 1 ? 's' : ''} connected</p>
+    <div class="accounts-inner">
+      <div class="accounts-page-header">
+        <h2 class="accounts-page-title">Connected Accounts</h2>
+        <p class="accounts-page-subtitle">${accounts.length} account${accounts.length !== 1 ? 's' : ''} connected</p>
+      </div>
+      <div class="accounts-page-list">
+        ${cardsHtml || '<p class="accounts-page-empty">No accounts connected yet.</p>'}
+      </div>
+      <button class="accounts-connect-btn">+ Connect Gmail Account</button>
     </div>
-    <div class="accounts-page-list">
-      ${cardsHtml || '<p class="accounts-page-empty">No accounts connected yet.</p>'}
-    </div>
-    <button class="accounts-connect-btn">+ Connect Gmail Account</button>
   `;
 }
 

@@ -385,13 +385,11 @@ pub fn is_retryable_email_error(error: &anyhow::Error) -> bool {
     }
 
     for cause in error.chain() {
-        if let Some(api_err) = cause.downcast_ref::<GmailApiError>() {
-            match api_err {
-                GmailApiError::HttpError(_) | GmailApiError::Io(_) | GmailApiError::JsonDecodeError(_, _) => {
-                    return true;
-                }
-                _ => {}
-            }
+        if let Some(GmailApiError::HttpError(_)
+        | GmailApiError::Io(_)
+        | GmailApiError::JsonDecodeError(_, _)) = cause.downcast_ref::<GmailApiError>()
+        {
+            return true;
         }
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             use std::io::ErrorKind;
@@ -421,10 +419,8 @@ pub fn is_retryable_email_error(error: &anyhow::Error) -> bool {
 
 fn status_from_error(error: &anyhow::Error) -> Option<StatusCode> {
     for cause in error.chain() {
-        if let Some(api_err) = cause.downcast_ref::<GmailApiError>() {
-            if let GmailApiError::Failure(response) = api_err {
-                return Some(response.status());
-            }
+        if let Some(GmailApiError::Failure(response)) = cause.downcast_ref::<GmailApiError>() {
+            return Some(response.status());
         }
     }
     None
@@ -443,6 +439,14 @@ pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'stati
         snippet.unwrap_or("")
     ).to_lowercase();
 
+    // Non-order emails: membership notices and promotional emails
+    if combined.contains("membership") || combined.contains("walmart+") {
+        return "unknown";
+    }
+    if combined.contains("free delivery") || combined.contains("promo code") {
+        return "unknown";
+    }
+
     if combined.contains("cancel") {
         "cancellation"
     } else if combined.contains("delivered") || combined.contains("has arrived")
@@ -452,7 +456,9 @@ pub fn infer_event_type(subject: Option<&str>, snippet: Option<&str>) -> &'stati
     } else if combined.contains("shipped") || combined.contains("on its way") {
         "shipping"
     } else if combined.contains("confirmed") || combined.contains("confirmation")
-        || combined.contains("order placed") || combined.contains("thanks for your order")
+        || combined.contains("order placed")
+        || combined.contains("thanks for your delivery order")
+        || combined.contains("thanks for your order")
     {
         "confirmation"
     } else if combined.contains("delay") {

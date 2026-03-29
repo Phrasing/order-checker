@@ -25,7 +25,7 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(30))
             .pragma("foreign_keys", "ON")
             .pragma("synchronous", "NORMAL")
-            .pragma("cache_size", "-8000");
+            .pragma("cache_size", "-16000");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -49,7 +49,7 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(30))
             .pragma("foreign_keys", "ON")
             .pragma("synchronous", "NORMAL")
-            .pragma("cache_size", "-8000");
+            .pragma("cache_size", "-16000");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
@@ -107,6 +107,7 @@ impl Database {
             "ALTER TABLE raw_emails ADD COLUMN recipient TEXT",
             "ALTER TABLE orders ADD COLUMN recipient TEXT",
             "ALTER TABLE orders ADD COLUMN cancel_reason TEXT",
+            "ALTER TABLE tracking_cache ADD COLUMN estimated_delivery TEXT",
         ];
         for sql in optional_columns {
             match sqlx::query(sql).execute(&self.pool).await {

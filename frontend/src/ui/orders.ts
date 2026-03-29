@@ -1,9 +1,10 @@
-import type { OrderViewModel } from '../types';
+import type { OrderViewModel, SortMode, SortDirection } from '../types';
 import {
   allOrders,
   allAccounts,
   currentFilter,
   currentSort,
+  currentSortDirection,
   currentAccountId,
   currentSearchQuery,
   currentRenderedOrders,
@@ -20,6 +21,8 @@ import {
   productSummaryCache,
   setAllOrders,
   setAllAccounts,
+  setCurrentSort,
+  setCurrentSortDirection,
   setCurrentRenderedOrders,
   setExpandedOrderId,
   setOrderThumbObserver,
@@ -40,7 +43,7 @@ import {
 import * as api from '../api';
 import { renderSidebar, updateHeader, updateResultsCount } from './sidebar';
 import { renderTrackingSection, loadCachedTrackingStatus } from './tracking';
-import { renderAccountSelector } from './accounts';
+import { renderAccountSelector, showWelcomeOverlay, hideWelcomeOverlay } from './accounts';
 
 export async function loadDashboard(): Promise<void> {
   try {
@@ -68,6 +71,12 @@ export async function loadDashboard(): Promise<void> {
     // Keep allOrders for backward compatibility (will be replaced by loaded orders for filtering)
     setAllOrders(data.paginated_orders.orders || []);
     setAllAccounts(data.accounts || []);
+
+    if ((data.accounts || []).length === 0) {
+      showWelcomeOverlay();
+    } else {
+      hideWelcomeOverlay();
+    }
 
     renderSidebar(data);
     renderAccountSelector(allAccounts);
@@ -187,9 +196,19 @@ export function applyFiltersAndRenderDebounced(delay = 200): void {
   }, delay);
 }
 
+// Track last rendered virtual scroll range to skip redundant DOM updates
+let lastVsStart = -1;
+let lastVsEnd = -1;
+let lastVsTotal = -1;
+
 function renderOrders(orders: OrderViewModel[]): void {
   const container = document.getElementById('order-list');
   if (!container) return;
+
+  // Reset range tracking on full re-render (data changed)
+  lastVsStart = -1;
+  lastVsEnd = -1;
+  lastVsTotal = -1;
 
   if (orders.length === 0) {
     container.innerHTML = `
@@ -200,7 +219,7 @@ function renderOrders(orders: OrderViewModel[]): void {
     return;
   }
 
-  const sorted = sortOrders(orders, currentSort);
+  const sorted = sortOrders(orders, currentSort, currentSortDirection);
   setCurrentRenderedOrders(sorted);
 
   // Use virtual scrolling for large lists
@@ -233,6 +252,15 @@ function renderVirtualScrollOrders(orders: OrderViewModel[], container: HTMLElem
     orders.length,
     Math.ceil((scrollTop + containerHeight) / itemHeight) + bufferSize
   );
+
+  // Skip DOM update if visible range and total haven't changed.
+  // The existing DOM, scroll listener, and IntersectionObserver all remain intact.
+  if (visibleStart === lastVsStart && visibleEnd === lastVsEnd && orders.length === lastVsTotal) {
+    return;
+  }
+  lastVsStart = visibleStart;
+  lastVsEnd = visibleEnd;
+  lastVsTotal = orders.length;
 
   // Update virtual scroll state
   setVirtualScrollState({
@@ -272,15 +300,14 @@ function setupScrollListener(container: HTMLElement): void {
     container.removeEventListener('scroll', oldListener);
   }
 
-  // Debounced scroll handler for performance
-  let scrollTimeout: number | null = null;
+  // Use requestAnimationFrame to sync re-renders with browser paint cycle
+  let rafId: number | null = null;
   const scrollListener = () => {
-    if (scrollTimeout !== null) {
-      clearTimeout(scrollTimeout);
-    }
-    scrollTimeout = window.setTimeout(() => {
+    if (rafId !== null) return; // Already scheduled for next frame
+    rafId = requestAnimationFrame(() => {
+      rafId = null;
       renderOrders(currentRenderedOrders);
-    }, 16); // ~60fps
+    });
   };
 
   container.addEventListener('scroll', scrollListener, { passive: true });
@@ -318,7 +345,9 @@ function buildOrdersHtml(orders: OrderViewModel[]): string {
       <div class="order-items-count">${order.items?.length || 0} items</div>
     </div>
     <div class="order-details${isExpanded ? ' show' : ''}" id="details-${order.id}">
-      ${renderOrderDetails(order)}
+      <div class="order-details-inner">
+        ${renderOrderDetails(order)}
+      </div>
     </div>
   `;
   }).join('');
@@ -541,4 +570,98 @@ function observeOrderThumbnails(): void {
   document
     .querySelectorAll<HTMLImageElement>('img.order-thumb[data-image-id], img.order-thumb[data-fallback-url]')
     .forEach(img => observer.observe(img));
+}
+
+// Load all remaining paginated orders (for non-date sorting)
+
+async function loadAllRemainingOrders(): Promise<void> {
+  while (hasMoreOrders && nextCursor) {
+    const { startDate, endDate } = getDateRangeParams();
+    const data = await api.fetchMoreOrders(
+      currentAccountId,
+      startDate,
+      endDate,
+      currentFilter === 'all' ? null : currentFilter,
+      nextCursor,
+      500, // max page size to minimize round-trips
+    );
+
+    appendLoadedOrders(data.orders);
+    setHasMoreOrders(data.has_more);
+    setNextCursor(data.next_cursor);
+  }
+
+  setAllOrders([...loadedOrders]);
+}
+
+// Sort bar
+
+const defaultSortDirections: Record<string, SortDirection> = {
+  date: 'desc',
+  price: 'desc',
+  status: 'asc',
+  quantity: 'desc',
+  items: 'desc',
+};
+
+export function setupSortBar(): void {
+  const sortBar = document.getElementById('sort-bar');
+  if (!sortBar) return;
+
+  sortBar.addEventListener('click', (e) => {
+    const col = (e.target as HTMLElement).closest<HTMLElement>('.sortable');
+    if (!col) return;
+
+    const sortKey = col.dataset.sort;
+    if (!sortKey) return;
+
+    if (currentSort === sortKey) {
+      setCurrentSortDirection(currentSortDirection === 'asc' ? 'desc' : 'asc');
+    } else {
+      setCurrentSort(sortKey as SortMode);
+      setCurrentSortDirection(defaultSortDirections[sortKey] || 'desc');
+    }
+
+    updateSortBarUI();
+
+    // For non-date sorts, load all remaining orders first so the sort
+    // covers the full dataset, not just the first loaded page.
+    if (hasMoreOrders) {
+      loadAllRemainingOrders().then(() => {
+        applyFiltersAndRender();
+      }).catch(err => {
+        console.error('Failed to load all orders for sort:', err);
+        applyFiltersAndRender();
+      });
+    } else {
+      applyFiltersAndRender();
+    }
+  });
+}
+
+function updateSortBarUI(): void {
+  const sortBar = document.getElementById('sort-bar');
+  if (!sortBar) return;
+
+  sortBar.querySelectorAll('.sortable').forEach(col => {
+    const el = col as HTMLElement;
+    let arrow = el.querySelector('.sort-arrow');
+    const isActive = el.dataset.sort === currentSort;
+
+    el.classList.toggle('active', isActive);
+
+    if (isActive) {
+      const arrowChar = currentSortDirection === 'asc' ? '\u25B2' : '\u25BC';
+      if (arrow) {
+        arrow.textContent = arrowChar;
+      } else {
+        const span = document.createElement('span');
+        span.className = 'sort-arrow';
+        span.textContent = arrowChar;
+        el.appendChild(span);
+      }
+    } else if (arrow) {
+      arrow.remove();
+    }
+  });
 }
